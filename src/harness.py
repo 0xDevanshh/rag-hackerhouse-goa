@@ -79,7 +79,9 @@ class PipelineResult(BaseModel):
     """The outcome of one PipelineHarness.run() call."""
 
     answer: str
+    query_text: str = ""
     sources: list[Chunk] = Field(default_factory=list)
+    scores: list[float] = Field(default_factory=list)
     latency_trace: LatencyTrace
     guard_flags: dict[str, GuardResult] = Field(default_factory=dict)
     degraded: bool = False
@@ -229,11 +231,15 @@ class PipelineHarness:
         latency_trace: LatencyTrace,
         guard_flags: dict[str, GuardResult],
         errors: list[StageError],
+        query_text: str = "",
         sources: list[Chunk] | None = None,
+        scores: list[float] | None = None,
     ) -> PipelineResult:
         return PipelineResult(
             answer=answer,
+            query_text=query_text,
             sources=sources or [],
+            scores=scores or [],
             latency_trace=latency_trace,
             guard_flags=guard_flags,
             degraded=True,
@@ -278,11 +284,12 @@ class PipelineHarness:
         # Stage 2: InputGuardrail
         input_result = self._run_stage("input_guardrail", latency_trace, errors, self.input_guardrail.check, query_text)
         if input_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors)
+            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
         guard_flags["input"] = input_result
         if not input_result.allowed:
             return PipelineResult(
                 answer=input_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
                 sources=[],
                 latency_trace=latency_trace,
                 guard_flags=guard_flags,
@@ -293,19 +300,24 @@ class PipelineHarness:
         # Stage 3: chunking/retrieval (chunking is skipped once the store is indexed)
         retrieval_result = self._retrieve_stage(query_text, latency_trace, errors)
         if retrieval_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors)
+            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
 
         # Stage 4: RelevanceGuardrail
         relevance_result = self._run_stage(
             "relevance_guardrail", latency_trace, errors, self.relevance_guardrail.check, retrieval_result
         )
         if relevance_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, sources=retrieval_result.chunks)
+            return self._degraded(
+                REFUSAL_RESPONSE, latency_trace, guard_flags, errors,
+                query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            )
         guard_flags["relevance"] = relevance_result
         if not relevance_result.allowed:
             return PipelineResult(
                 answer=relevance_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
                 sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
                 latency_trace=latency_trace,
                 guard_flags=guard_flags,
                 degraded=False,
@@ -320,7 +332,9 @@ class PipelineHarness:
                 latency_trace,
                 guard_flags,
                 errors,
+                query_text=query_text,
                 sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
             )
 
         # Stage 6: GroundingGuardrail
@@ -328,12 +342,17 @@ class PipelineHarness:
             "grounding_guardrail", latency_trace, errors, self.grounding_guardrail.check, answer_text, retrieval_result.chunks
         )
         if grounding_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, sources=retrieval_result.chunks)
+            return self._degraded(
+                REFUSAL_RESPONSE, latency_trace, guard_flags, errors,
+                query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            )
         guard_flags["grounding"] = grounding_result
         if not grounding_result.allowed:
             return PipelineResult(
                 answer=grounding_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
                 sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
                 latency_trace=latency_trace,
                 guard_flags=guard_flags,
                 degraded=False,
@@ -343,7 +362,9 @@ class PipelineHarness:
         # Final response
         return PipelineResult(
             answer=answer_text,
+            query_text=query_text,
             sources=retrieval_result.chunks,
+            scores=retrieval_result.scores,
             latency_trace=latency_trace,
             guard_flags=guard_flags,
             degraded=False,

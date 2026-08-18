@@ -5,6 +5,7 @@ pydantic
 datasets
 fastapi
 uvicorn
+python-multipart
 anthropic
 groq
 requests
