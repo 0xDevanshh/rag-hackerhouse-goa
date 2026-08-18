@@ -1,0 +1,12 @@
+[
+  {
+    "id": "doc-001",
+    "title": "Sample Document One",
+    "text": "This is placeholder text for the first sample document in the corpus."
+  },
+  {
+    "id": "doc-002",
+    "title": "Sample Document Two",
+    "text": "This is placeholder text for the second sample document in the corpus."
+  }
+]
