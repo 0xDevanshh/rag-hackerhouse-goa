@@ -18,8 +18,9 @@ import time
 from contextlib import contextmanager
 from typing import Any
 
+import requests
 from pydantic import BaseModel, Field
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src import stt
 from src.chunking import Chunk
@@ -29,6 +30,16 @@ from src.retrieval import Retriever, RetrievalResult
 from src.vectorstore import VectorStore
 
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+
+
+def _is_transient_stt_error(exc: BaseException) -> bool:
+    """Network hiccups and rate limits/server errors are worth retrying; other failures aren't."""
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        return status is not None and (status == 429 or status >= 500)
+    return False
 
 
 def _is_audio_path(value: str) -> bool:
@@ -101,6 +112,7 @@ class PipelineHarness:
         store: VectorStore,
         chunks: list[Chunk] | None = None,
         generator: Generator | None = None,
+        stt_client: stt.SarvamSTT | stt.MockSTT | None = None,
         input_guardrail: InputGuardrail | None = None,
         relevance_guardrail: RelevanceGuardrail | None = None,
         grounding_guardrail: GroundingGuardrail | None = None,
@@ -116,6 +128,10 @@ class PipelineHarness:
                 may be omitted) if `store` is already indexed.
             generator: the Generator to use. Defaults to Generator() (reads
                 LLM_PROVIDER from the environment).
+            stt_client: a SarvamSTT or MockSTT instance. If omitted, a
+                SarvamSTT() is constructed lazily the first time audio input
+                actually needs transcribing (so text-only usage never
+                requires a SARVAM_API_KEY). Inject a MockSTT for tests.
             input_guardrail, relevance_guardrail, grounding_guardrail:
                 guardrail instances to use. Default to their own defaults.
             max_retries: retries (beyond the first attempt) for the STT
@@ -127,6 +143,7 @@ class PipelineHarness:
         self.store = store
         self.chunks = chunks or []
         self.generator = generator or Generator()
+        self.stt_client = stt_client
         self.input_guardrail = input_guardrail or InputGuardrail()
         self.relevance_guardrail = relevance_guardrail or RelevanceGuardrail()
         self.grounding_guardrail = grounding_guardrail or GroundingGuardrail()
@@ -155,20 +172,21 @@ class PipelineHarness:
             errors.append(StageError(stage=stage, error_type=type(exc).__name__, message=str(exc)))
             return None
 
-    def _transcribe(self, audio_input: str | bytes) -> str:
+    def _transcribe(self, audio_input: str | bytes, language_code: str = "unknown") -> str:
+        if self.stt_client is None:
+            self.stt_client = stt.SarvamSTT()
         if isinstance(audio_input, (bytes, bytearray)):
-            return stt.transcribe_bytes(audio_input)
-        return stt.transcribe_audio(audio_input)
+            audio_bytes = bytes(audio_input)
+        else:
+            with open(audio_input, "rb") as f:
+                audio_bytes = f.read()
+        return self.stt_client.transcribe(audio_bytes, language_code).transcript
 
     def _transcribe_with_retry(self, audio_input: str | bytes) -> str:
-        # STT has no typed transient-vs-permanent exception distinction yet
-        # (src/stt.py isn't implemented), so we retry broadly on Exception;
-        # narrow this once a real backend distinguishes network hiccups
-        # from unrecoverable errors (bad audio format, unsupported language).
         retrying = Retrying(
             stop=stop_after_attempt(self.max_retries + 1),
             wait=wait_exponential(multiplier=self.retry_wait_multiplier, min=1, max=10),
-            retry=retry_if_exception_type(Exception),
+            retry=retry_if_exception(_is_transient_stt_error),
             reraise=True,
         )
         return retrying(self._transcribe, audio_input)
