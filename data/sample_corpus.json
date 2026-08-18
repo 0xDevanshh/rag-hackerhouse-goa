@@ -2,11 +2,11 @@
   {
     "id": "doc-001",
     "title": "Sample Document One",
-    "text": "This is placeholder text for the first sample document in the corpus."
+    "text": "Retrieval-augmented generation combines a retriever with a language model. The retriever finds relevant passages from a corpus. The language model then conditions its answer on those passages. This reduces hallucination compared to relying on the model's parametric memory alone.\n\nChunking strategy has a large effect on retrieval quality. Chunks that are too small lose context, while chunks that are too large dilute relevance and hurt embedding quality. Sentence boundaries and paragraph boundaries are natural places to split text, since splitting mid-sentence can break semantic meaning. Overlap between chunks can help preserve context across chunk boundaries, at the cost of some duplicated content in the index."
   },
   {
     "id": "doc-002",
     "title": "Sample Document Two",
-    "text": "This is placeholder text for the second sample document in the corpus."
+    "text": "Voice interfaces add a transcription step before retrieval. Speech-to-text errors can propagate into the retriever and the generator, so guardrails should validate the query before it reaches the vector store. A query that fails guardrail checks should be rejected early rather than passed through to generation.\n\nEvaluation of a voice RAG system should cover the full pipeline, not just the language model output. Metrics worth tracking include transcription accuracy, retrieval precision at k, groundedness of the generated answer in the retrieved passages, and end-to-end latency from audio input to spoken or written response."
   }
 ]

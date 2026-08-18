@@ -2,9 +2,11 @@ sentence-transformers
 faiss-cpu
 numpy
 pydantic
+datasets
 fastapi
 uvicorn
 anthropic
+groq
 requests
 python-dotenv
 tenacity
