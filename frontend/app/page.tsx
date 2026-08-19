@@ -8,6 +8,26 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 type BackendStatus = "checking" | "up" | "down";
 type UiState = "idle" | "recording" | "processing" | "result" | "error";
 
+interface SentenceEvent {
+  event: "sentence";
+  text: string;
+}
+
+interface DoneEvent {
+  event: "done";
+  result: PipelineResult;
+}
+
+function parseSseFrame(frame: string): { event: string; data: string } | null {
+  let eventType = "message";
+  let data = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    else if (line.startsWith("data:")) data += line.slice(5).trim();
+  }
+  return data ? { event: eventType, data } : null;
+}
+
 function getStageDuration(trace: LatencyTrace, stage: string): number | null {
   const match = trace.stages.find((s) => s.stage === stage);
   return match ? match.duration_ms : null;
@@ -25,6 +45,8 @@ export default function Home() {
   const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
   const [uiState, setUiState] = useState<UiState>("idle");
   const [result, setResult] = useState<PipelineResult | null>(null);
+  const [streamingAnswer, setStreamingAnswer] = useState("");
+  const [isStreaming, setIsStreaming] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -66,27 +88,58 @@ export default function Home() {
   const sendAudio = async (blob: Blob) => {
     setUiState("processing");
     setErrorMessage(null);
+    setResult(null);
+    setStreamingAnswer("");
+    setIsStreaming(true);
+
     try {
       const formData = new FormData();
       const extension = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
       formData.append("audio", blob, `recording.${extension}`);
 
-      const res = await fetch(`${API_URL}/query`, {
+      const res = await fetch(`${API_URL}/query/stream`, {
         method: "POST",
         body: formData,
       });
 
-      if (!res.ok) {
+      if (!res.ok || !res.body) {
         const detail = await res.json().catch(() => null);
         throw new Error(detail?.detail || `Request failed with status ${res.status}`);
       }
 
-      const data: PipelineResult = await res.json();
-      setResult(data);
-      setUiState("result");
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let frameEnd;
+        while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, frameEnd);
+          buffer = buffer.slice(frameEnd + 2);
+          const parsed = parseSseFrame(frame);
+          if (!parsed) continue;
+
+          if (parsed.event === "sentence") {
+            const payload = JSON.parse(parsed.data) as SentenceEvent;
+            setStreamingAnswer((prev) => (prev ? `${prev} ${payload.text}` : payload.text));
+            setUiState("result");
+          } else if (parsed.event === "done") {
+            const payload = JSON.parse(parsed.data) as DoneEvent;
+            setResult(payload.result);
+            setIsStreaming(false);
+            setUiState("result");
+          }
+        }
+      }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Something went wrong while contacting the backend.");
       setUiState("error");
+    } finally {
+      setIsStreaming(false);
     }
   };
 
@@ -138,6 +191,8 @@ export default function Home() {
 
   const reset = () => {
     setResult(null);
+    setStreamingAnswer("");
+    setIsStreaming(false);
     setErrorMessage(null);
     setUiState("idle");
   };
@@ -182,7 +237,8 @@ export default function Home() {
           {uiState === "idle" && "Tap to ask a question"}
           {uiState === "recording" && "Listening… tap to stop"}
           {uiState === "processing" && <span className="spinner" aria-label="Processing" />}
-          {uiState === "result" && "Done — tap Record to ask another question"}
+          {uiState === "result" && !isStreaming && "Done — tap Record to ask another question"}
+          {uiState === "result" && isStreaming && "Generating…"}
           {uiState === "error" && "Tap Record to try again"}
         </div>
       </div>
@@ -191,6 +247,18 @@ export default function Home() {
         <div className="errorBox">
           <strong>Something went wrong.</strong>
           <p>{errorMessage}</p>
+        </div>
+      )}
+
+      {uiState === "result" && !result && (
+        <div className="resultSection">
+          <div className="card">
+            <h2>
+              Answer
+              {isStreaming && <span className="spinner streamingSpinner" aria-label="Generating" />}
+            </h2>
+            <p className="answerText">{streamingAnswer || "…"}</p>
+          </div>
         </div>
       )}
 

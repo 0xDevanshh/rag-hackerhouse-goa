@@ -197,3 +197,28 @@ class GroundingGuardrail:
             )
 
         return GuardResult(allowed=True, reason="ok")
+
+    def is_sentence_grounded(self, sentence: str, retrieved_chunks: list[Chunk]) -> bool:
+        """
+        Check a single sentence against retrieved_chunks using the same
+        max-cosine-similarity test as check(), without the whole-answer
+        unsupported-ratio aggregation. Used for incremental (streaming)
+        grounding checks, where each sentence is validated as soon as it's
+        generated instead of waiting for the complete answer.
+
+        Args:
+            sentence: a single generated sentence.
+            retrieved_chunks: the chunks the answer was generated from.
+
+        Returns:
+            bool: True if the sentence's max similarity to any retrieved
+            chunk meets grounding_threshold.
+        """
+        if not sentence.strip() or not retrieved_chunks:
+            return False
+        chunk_embeddings = self.embedder.encode([chunk.text for chunk in retrieved_chunks])
+        sentence_embedding = self.embedder.encode([sentence])[0]
+        max_similarity = max(
+            _cosine_similarity(sentence_embedding, chunk_embedding) for chunk_embedding in chunk_embeddings
+        )
+        return max_similarity >= self.grounding_threshold

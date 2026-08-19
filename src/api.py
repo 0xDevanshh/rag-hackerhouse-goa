@@ -8,17 +8,25 @@ the frontend check backend availability before allowing recording.
 
 import json
 import os
+import sys
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if __name__ == "__main__" and str(ROOT_DIR) not in sys.path:
+    # Allow `python src/api.py` to work directly: when run as a script (not
+    # via `-m` or an installed package), Python puts src/ on sys.path
+    # instead of the repo root, so `from src....` below would otherwise fail.
+    sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from src.chunking import ChunkerRegistry
 from src.harness import PipelineHarness, PipelineResult
 from src.vectorstore import VectorStore
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 
 DEFAULT_CORPUS_PATH = ROOT_DIR / "data" / "sample_corpus.json"
@@ -70,6 +78,26 @@ def get_harness() -> PipelineHarness:
         raise HTTPException(status_code=503, detail=f"Pipeline not configured: {exc}") from exc
 
 
+@app.on_event("startup")
+def _warm_up_harness() -> None:
+    """
+    Eagerly build the harness and index its corpus at process startup,
+    instead of lazily on the first request. Without this, whichever request
+    happens to arrive first pays the one-time corpus-chunking/embedding-
+    model-loading cost (roughly 1-1.5s) as part of its own latency — a
+    one-time cost belongs at startup, not inside a live request's budget.
+    """
+    try:
+        harness = get_harness()
+    except HTTPException:
+        # No LLM key configured yet: get_harness() already recorded
+        # _harness_init_error, so /query will return a clear 503 on first
+        # use. Nothing to warm up until that's fixed (and the process
+        # restarted) — startup itself must still succeed either way.
+        return
+    harness.store.build(harness.chunks)
+
+
 @app.get("/health")
 def health() -> dict:
     """Liveness check for the frontend to confirm the backend is reachable."""
@@ -90,7 +118,33 @@ async def query(audio: UploadFile = File(...)) -> PipelineResult:
     """
     harness = get_harness()
     audio_bytes = await audio.read()
-    return await harness.run(audio_bytes)
+    return await harness.run(audio_bytes, filename=audio.filename or "audio.wav", content_type=audio.content_type)
+
+
+@app.post("/query/stream")
+async def query_stream(audio: UploadFile = File(...)) -> StreamingResponse:
+    """
+    Streaming counterpart to /query: same input, but sends each accepted
+    (grounding-checked) sentence to the client as Server-Sent Events as
+    soon as it's ready, instead of waiting for the complete answer. Reduces
+    perceived latency for the (network-bound, non-optimizable) generation
+    stage without weakening GroundingGuardrail — see
+    PipelineHarness.run_streaming.
+
+    Emits `event: sentence` frames with `{"text": "..."}` as they're
+    accepted, followed by exactly one `event: done` frame with the full
+    PipelineResult JSON (mirroring POST /query's response body).
+    """
+    harness = get_harness()
+    audio_bytes = await audio.read()
+    filename = audio.filename or "audio.wav"
+    content_type = audio.content_type
+
+    async def event_stream():
+        async for event in harness.run_streaming(audio_bytes, filename=filename, content_type=content_type):
+            yield f"event: {event.event}\ndata: {event.model_dump_json()}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":

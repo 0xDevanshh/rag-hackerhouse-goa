@@ -10,6 +10,7 @@ interface each backend implements.
 
 import os
 from abc import ABC, abstractmethod
+from typing import AsyncIterator
 
 import anthropic
 import groq
@@ -19,7 +20,10 @@ from src.chunking import Chunk
 
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
-DEFAULT_MAX_TOKENS = 1024
+# Short answers grounded in a couple of retrieved passages don't need much
+# headroom; capping this tightens generation latency without cutting off a
+# well-behaved answer (the system prompt already asks for concise, cited text).
+DEFAULT_MAX_TOKENS = 300
 
 NO_CONTEXT_RESPONSE = "I don't have enough information in the provided context to answer that."
 
@@ -71,6 +75,30 @@ class LLMProvider(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def stream_answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> AsyncIterator[str]:
+        """
+        Stream an answer to query as it's generated, grounded strictly in
+        retrieved_chunks, yielding raw text deltas as they arrive.
+
+        Note: unlike answer(), this has no retry wrapping — tenacity's retry
+        doesn't compose with an async generator once partial output has
+        already been yielded, so a mid-stream failure simply ends the
+        stream (raising GenerationError) rather than restarting from
+        scratch.
+
+        Args:
+            query: the user's question.
+            retrieved_chunks: (chunk, score) pairs for context.
+
+        Yields:
+            str: successive text deltas as the model generates them.
+
+        Raises:
+            GenerationError: if the provider fails before or during streaming.
+        """
+        raise NotImplementedError
+
 
 class GroqProvider(LLMProvider):
     """Generates answers via the Groq API (OpenAI-compatible chat completions)."""
@@ -114,6 +142,25 @@ class GroqProvider(LLMProvider):
             raise GenerationError(f"Groq generation failed after retries: {exc}") from exc
         return response.choices[0].message.content.strip()
 
+    async def stream_answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> AsyncIterator[str]:
+        user_message = _build_user_message(query, retrieved_chunks)
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                stream=True,
+            )
+            async for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield delta
+        except Exception as exc:
+            raise GenerationError(f"Groq streaming generation failed: {exc}") from exc
+
 
 class AnthropicProvider(LLMProvider):
     """Generates answers via the Anthropic API, as a fallback/alternate to GroqProvider."""
@@ -155,6 +202,20 @@ class AnthropicProvider(LLMProvider):
         except Exception as exc:
             raise GenerationError(f"Anthropic generation failed after retries: {exc}") from exc
         return "".join(block.text for block in response.content if block.type == "text").strip()
+
+    async def stream_answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> AsyncIterator[str]:
+        user_message = _build_user_message(query, retrieved_chunks)
+        try:
+            async with self.client.messages.stream(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield text
+        except Exception as exc:
+            raise GenerationError(f"Anthropic streaming generation failed: {exc}") from exc
 
 
 _PROVIDERS: dict[str, type[LLMProvider]] = {
@@ -211,3 +272,21 @@ class Generator:
             catch it and fall back to a degraded response path.
         """
         return await self.provider.answer(query, retrieved_chunks)
+
+    def stream_answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> AsyncIterator[str]:
+        """
+        Stream an answer to query, grounded strictly in retrieved_chunks.
+
+        Args:
+            query: the user's question.
+            retrieved_chunks: (chunk, score) pairs, e.g.
+                zip(retrieval_result.chunks, retrieval_result.scores).
+
+        Yields:
+            str: successive text deltas as the model generates them.
+
+        Raises:
+            GenerationError: if the underlying provider fails before or
+            during streaming (no retry — see LLMProvider.stream_answer).
+        """
+        return self.provider.stream_answer(query, retrieved_chunks)

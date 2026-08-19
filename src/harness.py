@@ -14,9 +14,11 @@ Two responsibilities:
 
 import asyncio
 import os
+import re
 import time
 from contextlib import contextmanager
-from typing import Any
+from pathlib import Path
+from typing import Any, AsyncIterator, Literal
 
 import requests
 from pydantic import BaseModel, Field
@@ -30,6 +32,7 @@ from src.retrieval import Retriever, RetrievalResult
 from src.vectorstore import VectorStore
 
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 def _is_transient_stt_error(exc: BaseException) -> bool:
@@ -86,6 +89,20 @@ class PipelineResult(BaseModel):
     guard_flags: dict[str, GuardResult] = Field(default_factory=dict)
     degraded: bool = False
     errors: list[StageError] = Field(default_factory=list)
+
+
+class StreamSentenceEvent(BaseModel):
+    """One incrementally-generated, individually grounding-checked sentence."""
+
+    event: Literal["sentence"] = "sentence"
+    text: str
+
+
+class StreamDoneEvent(BaseModel):
+    """Final event of a PipelineHarness.run_streaming() call, carrying the completed PipelineResult."""
+
+    event: Literal["done"] = "done"
+    result: PipelineResult
 
 
 class PipelineHarness:
@@ -174,29 +191,48 @@ class PipelineHarness:
             errors.append(StageError(stage=stage, error_type=type(exc).__name__, message=str(exc)))
             return None
 
-    def _transcribe(self, audio_input: str | bytes, language_code: str = "unknown") -> str:
+    def _transcribe(
+        self,
+        audio_input: str | bytes,
+        language_code: str = "unknown",
+        filename: str = "audio.wav",
+        content_type: str | None = None,
+    ) -> str:
         if self.stt_client is None:
             self.stt_client = stt.SarvamSTT()
         if isinstance(audio_input, (bytes, bytearray)):
             audio_bytes = bytes(audio_input)
         else:
+            filename = Path(audio_input).name
+            content_type = None
             with open(audio_input, "rb") as f:
                 audio_bytes = f.read()
-        return self.stt_client.transcribe(audio_bytes, language_code).transcript
+        return self.stt_client.transcribe(
+            audio_bytes, language_code, filename=filename, content_type=content_type
+        ).transcript
 
-    def _transcribe_with_retry(self, audio_input: str | bytes) -> str:
+    def _transcribe_with_retry(
+        self, audio_input: str | bytes, filename: str = "audio.wav", content_type: str | None = None
+    ) -> str:
         retrying = Retrying(
             stop=stop_after_attempt(self.max_retries + 1),
             wait=wait_exponential(multiplier=self.retry_wait_multiplier, min=1, max=10),
             retry=retry_if_exception(_is_transient_stt_error),
             reraise=True,
         )
-        return retrying(self._transcribe, audio_input)
+        return retrying(self._transcribe, audio_input, "unknown", filename, content_type)
 
-    async def _transcribe_stage(self, audio_input: str | bytes, latency_trace: LatencyTrace, errors: list[StageError]) -> str | None:
+    async def _transcribe_stage(
+        self,
+        audio_input: str | bytes,
+        filename: str,
+        content_type: str | None,
+        latency_trace: LatencyTrace,
+        errors: list[StageError],
+    ) -> str | None:
         try:
             with self._timed(latency_trace, "stt"):
-                return await asyncio.to_thread(self._transcribe_with_retry, audio_input)
+                return await asyncio.to_thread(self._transcribe_with_retry, audio_input, filename, content_type)
         except Exception as exc:
             errors.append(StageError(stage="stt", error_type=type(exc).__name__, message=str(exc)))
             return None
@@ -246,7 +282,9 @@ class PipelineHarness:
             errors=errors,
         )
 
-    async def run(self, audio_or_text_input: str | bytes) -> PipelineResult:
+    async def run(
+        self, audio_or_text_input: str | bytes, filename: str = "audio.wav", content_type: str | None = None
+    ) -> PipelineResult:
         """
         Run one request through the full pipeline.
 
@@ -254,6 +292,17 @@ class PipelineHarness:
             audio_or_text_input: either raw audio bytes, a path to an audio
                 file (detected by extension), or an already-transcribed
                 text query.
+            filename: filename (with a real audio extension, e.g.
+                "recording.webm") describing raw audio bytes' format. Only
+                used when audio_or_text_input is bytes — Sarvam needs this
+                to know the codec, since bytes alone carry no format info.
+                Ignored for str inputs (a path's own extension is used) and
+                for text queries.
+            content_type: the audio's real MIME type (e.g. "audio/webm"),
+                when audio_or_text_input is bytes. Sarvam rejects requests
+                with no resolvable Content-Type, so prefer passing this
+                (e.g. the browser upload's real Content-Type) over relying
+                on a guess from `filename`'s extension alone.
 
         Returns:
             PipelineResult: the final answer, its source chunks, a timing
@@ -270,7 +319,7 @@ class PipelineHarness:
             isinstance(audio_or_text_input, str) and _is_audio_path(audio_or_text_input)
         )
         if is_audio:
-            query_text = await self._transcribe_stage(audio_or_text_input, latency_trace, errors)
+            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, latency_trace, errors)
             if query_text is None:
                 return self._degraded(
                     "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
@@ -369,6 +418,183 @@ class PipelineHarness:
             guard_flags=guard_flags,
             degraded=False,
             errors=errors,
+        )
+
+    async def run_streaming(
+        self, audio_or_text_input: str | bytes, filename: str = "audio.wav", content_type: str | None = None
+    ) -> AsyncIterator[StreamSentenceEvent | StreamDoneEvent]:
+        """
+        Streaming counterpart to run(). STT, InputGuardrail,
+        chunking/retrieval, and RelevanceGuardrail run exactly as in run()
+        — none of them benefit from streaming. For generation, text deltas
+        are accumulated into sentences as the LLM streams; each complete
+        sentence is checked individually via
+        GroundingGuardrail.is_sentence_grounded() and only yielded if it
+        passes, so an ungrounded sentence is silently dropped rather than
+        ever reaching the caller. This is a *stricter* guarantee than
+        run()'s 30%-tolerant whole-answer check — every individual sentence
+        must pass here, not just enough of them in aggregate.
+
+        Yields a StreamSentenceEvent for each accepted sentence as it's
+        ready, followed by exactly one StreamDoneEvent carrying the final
+        PipelineResult (built from only the accepted sentences).
+        """
+        latency_trace = LatencyTrace()
+        errors: list[StageError] = []
+        guard_flags: dict[str, GuardResult] = {}
+
+        # Stage 1: STT
+        is_audio = isinstance(audio_or_text_input, (bytes, bytearray)) or (
+            isinstance(audio_or_text_input, str) and _is_audio_path(audio_or_text_input)
+        )
+        if is_audio:
+            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, latency_trace, errors)
+            if query_text is None:
+                yield StreamDoneEvent(
+                    result=self._degraded(
+                        "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
+                        latency_trace,
+                        guard_flags,
+                        errors,
+                    )
+                )
+                return
+        else:
+            query_text = audio_or_text_input
+
+        # Stage 2: InputGuardrail
+        input_result = self._run_stage("input_guardrail", latency_trace, errors, self.input_guardrail.check, query_text)
+        if input_result is None:
+            yield StreamDoneEvent(
+                result=self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
+            )
+            return
+        guard_flags["input"] = input_result
+        if not input_result.allowed:
+            yield StreamDoneEvent(
+                result=PipelineResult(
+                    answer=input_result.response_override or REFUSAL_RESPONSE,
+                    query_text=query_text,
+                    sources=[],
+                    latency_trace=latency_trace,
+                    guard_flags=guard_flags,
+                    degraded=False,
+                    errors=errors,
+                )
+            )
+            return
+
+        # Stage 3: chunking/retrieval
+        retrieval_result = self._retrieve_stage(query_text, latency_trace, errors)
+        if retrieval_result is None:
+            yield StreamDoneEvent(
+                result=self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
+            )
+            return
+
+        # Stage 4: RelevanceGuardrail
+        relevance_result = self._run_stage(
+            "relevance_guardrail", latency_trace, errors, self.relevance_guardrail.check, retrieval_result
+        )
+        if relevance_result is None:
+            yield StreamDoneEvent(
+                result=self._degraded(
+                    REFUSAL_RESPONSE,
+                    latency_trace,
+                    guard_flags,
+                    errors,
+                    query_text=query_text,
+                    sources=retrieval_result.chunks,
+                    scores=retrieval_result.scores,
+                )
+            )
+            return
+        guard_flags["relevance"] = relevance_result
+        if not relevance_result.allowed:
+            yield StreamDoneEvent(
+                result=PipelineResult(
+                    answer=relevance_result.response_override or REFUSAL_RESPONSE,
+                    query_text=query_text,
+                    sources=retrieval_result.chunks,
+                    scores=retrieval_result.scores,
+                    latency_trace=latency_trace,
+                    guard_flags=guard_flags,
+                    degraded=False,
+                    errors=errors,
+                )
+            )
+            return
+
+        # Stage 5: streaming generation, with per-sentence grounding as each one completes
+        retrieved_chunks = list(zip(retrieval_result.chunks, retrieval_result.scores))
+        accepted_sentences: list[str] = []
+        dropped_count = 0
+        buffer = ""
+        started_at = time.time()
+        try:
+            async for delta in self.generator.stream_answer(query_text, retrieved_chunks):
+                buffer += delta
+                while True:
+                    match = _SENTENCE_BOUNDARY_RE.search(buffer)
+                    if not match:
+                        break
+                    sentence, buffer = buffer[: match.end()].strip(), buffer[match.end() :]
+                    if not sentence:
+                        continue
+                    if self.grounding_guardrail.is_sentence_grounded(sentence, retrieval_result.chunks):
+                        accepted_sentences.append(sentence)
+                        yield StreamSentenceEvent(text=sentence)
+                    else:
+                        dropped_count += 1
+            trailing = buffer.strip()
+            if trailing:
+                if self.grounding_guardrail.is_sentence_grounded(trailing, retrieval_result.chunks):
+                    accepted_sentences.append(trailing)
+                    yield StreamSentenceEvent(text=trailing)
+                else:
+                    dropped_count += 1
+        except Exception as exc:
+            errors.append(StageError(stage="generation", error_type=type(exc).__name__, message=str(exc)))
+        finally:
+            ended_at = time.time()
+            latency_trace.stages.append(
+                StageTiming(stage="generation", started_at=started_at, ended_at=ended_at, duration_ms=(ended_at - started_at) * 1000)
+            )
+
+        if not accepted_sentences:
+            fallback = (
+                "I'm having trouble generating an answer right now. Please try again shortly."
+                if errors and errors[-1].stage == "generation"
+                else REFUSAL_RESPONSE
+            )
+            yield StreamDoneEvent(
+                result=self._degraded(
+                    fallback,
+                    latency_trace,
+                    guard_flags,
+                    errors,
+                    query_text=query_text,
+                    sources=retrieval_result.chunks,
+                    scores=retrieval_result.scores,
+                )
+            )
+            return
+
+        guard_flags["grounding"] = GuardResult(
+            allowed=True,
+            reason="ok" if dropped_count == 0 else f"dropped_{dropped_count}_ungrounded_sentence(s)",
+        )
+        yield StreamDoneEvent(
+            result=PipelineResult(
+                answer=" ".join(accepted_sentences),
+                query_text=query_text,
+                sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
+                latency_trace=latency_trace,
+                guard_flags=guard_flags,
+                degraded=False,
+                errors=errors,
+            )
         )
 
 
