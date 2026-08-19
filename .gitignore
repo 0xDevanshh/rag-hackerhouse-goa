@@ -4,3 +4,9 @@ __pycache__/
 .env
 *.index
 .pytest_cache/
+
+# Generated from ai4bharat/MSMARCO-XI — reproducible via benchmarks/run_eval.py
+data/msmarco_xi_cache/
+data/eval_set.json
+*.faiss
+*.meta.pkl

@@ -22,7 +22,11 @@ class FakeEmbedder:
 
     VOCAB = ["paris", "capital", "france", "cats", "purr", "banana"]
 
-    def encode(self, texts):
+    def encode(self, texts, **kwargs):
+        # **kwargs absorbs the real Embedder.encode's use_cache/timing/
+        # batch_size arguments, which callers now pass for latency
+        # instrumentation. This stand-in ignores them: it has no cache to
+        # consult and nothing worth timing.
         vectors = []
         for text in texts:
             lowered = text.lower()

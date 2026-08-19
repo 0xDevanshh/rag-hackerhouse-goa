@@ -14,6 +14,8 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, Field
 
+from src.text import split_sentences as _split_sentences
+
 
 class Chunk(BaseModel):
     """A single chunk of text produced by a Chunker, with provenance metadata."""
@@ -40,12 +42,6 @@ class Chunker(ABC):
             list[Chunk]: the chunks produced from this document.
         """
         raise NotImplementedError
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences on '.', '?', '!' followed by whitespace."""
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [s.strip() for s in sentences if s.strip()]
 
 
 class FixedSizeChunker(Chunker):

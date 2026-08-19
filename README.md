@@ -36,9 +36,10 @@ that separates what we control (in-process compute) from what we don't (third-pa
               PipelineResult { answer, query_text, sources,
                 scores, latency_trace, guard_flags, degraded }
 
-  Offline / lazy indexing (once per process):
-  data/sample_corpus.json → Chunker (src/chunking.py) → Embedder → FAISS IndexFlatIP
-                                                          (src/vectorstore.py)
+  Offline indexing (once, at startup):
+  ai4bharat/MSMARCO-XI → data_loader.py → MetadataAwareChunker → Embedder → FAISS IndexFlatIP
+   (hi + en passages)    (src/data_loader.py)  (src/chunking.py)        (src/vectorstore.py)
+     └─ falls back to data/sample_corpus.json + RecursiveChunker if the dataset can't be loaded
 ```
 
 A guardrail refusal or a failed stage never crashes the request — it short-circuits to a canned
@@ -110,6 +111,55 @@ to `POST /query` and renders the answer, sources, and latency breakdown.
   clearly-labeled simulated LLM provider if no `GROQ_API_KEY`/`ANTHROPIC_API_KEY` is set, so the
   benchmark (and CI) never needs real credentials to run end-to-end.
 
+## Corpus: ai4bharat/MSMARCO-XI (`src/data_loader.py`)
+
+MS MARCO translated into 13 Indic languages (~11.5M rows / 55.6GB). Each row carries a query, ~10
+candidate passages, and a reference answer in **both** the target language and the original English,
+plus per-passage `is_selected` relevance labels.
+
+The API indexes Hindi **and** English by default (both come from the same row, so no extra download),
+tagged `language: "hi"` / `"en"`. That makes the retriever's language-match boost and the vector store's
+metadata filter meaningful, and lets a query in either language retrieve.
+
+Configure via env vars: `CORPUS_LANGUAGE` (default `hi`), `CORPUS_SPLIT` (`validation`), `CORPUS_LIMIT`
+(`500`), `CORPUS_INCLUDE_ENGLISH` (`1`). Slices are cached under `data/msmarco_xi_cache/`, so only the
+first run touches the network; if the dataset can't be loaded at all, the API logs a warning and falls
+back to `data/sample_corpus.json` so it still starts offline.
+
+**Two loading traps this dataset sets.** It publishes exactly one builder config, `default`, and encodes
+language in the *parquet filename* (`validation/hinval.parquet`) with a 3-letter code:
+
+- Passing a language as the config — `load_dataset("ai4bharat/MSMARCO-XI", "hi", ...)` — raises
+  `ValueError: BuilderConfig 'hi' not found. Available: ['default']`.
+- Passing **no** config silently concatenates every language in file order, so the first rows come back
+  Assamese, not Hindi — a wrong-language index with no error.
+
+`_data_file()` addresses the parquet directly via `data_files=` to avoid both. Note Telugu ships a
+validation parquet but no train parquet, and `datasets` ≥ 4 ignores the repo's `ms_marco_translations.py`
+loading script entirely.
+
+## Retrieval evaluation (`benchmarks/run_eval.py`)
+
+`is_selected` doubles as retrieval ground truth, so retrieval accuracy is measurable without an LLM:
+hit rate@k, recall@k, precision@k, and MRR, split by query language. No API keys, no LLM spend,
+deterministic. Writes `data/eval_set.json` and `benchmarks/eval_report.md`.
+
+Two things the scoring has to get right:
+
+- **A passage counts once.** Each passage is indexed in both languages, so results are deduped by
+  `(query_id, passage_id)` before ranks are assigned — otherwise one passage retrieved in two languages
+  would look like two distinct hits.
+- **`is_selected` must not be a ranking feature.** `Retriever` boosts chunks tagged `is_selected` by
+  `+0.1` — but that flag *is* the label being scored, so leaving it on leaks ground truth into the
+  ranking. The eval passes `is_selected_boost=0.0` and reports the boosted run alongside as a control;
+  on the Hindi validation slice the leak is worth **+40pp hit rate@1** (22.8% → 62.5%). The boost is
+  also meaningless in production: `is_selected` is relevance *relative to the dataset's own query*, not
+  to whatever a user asks. Consider setting `IS_SELECTED_BOOST = 0`.
+
+About half the rows have no `is_selected` passage at all (252 of 500 in the Hindi validation slice);
+those are dropped from the eval set — scoring them would count an unlabeled query as a miss — but their
+passages stay in the index as distractors.
+
 ## Chunking strategies (`src/chunking.py`)
 
 Four strategies behind one `Chunker` interface, selectable via `ChunkerRegistry.build(name, **kwargs)`:
@@ -118,8 +168,13 @@ Four strategies behind one `Chunker` interface, selectable via `ChunkerRegistry.
 |---|---|---|
 | **FixedSizeChunker** | Sliding window over characters, fixed `overlap` | Cheap, deterministic baseline with no embedding cost at ingest — the control to compare smarter strategies against |
 | **SentenceSemanticChunker** | Sentences merged while running-centroid cosine similarity to the next sentence stays above `similarity_threshold` | Topic shifts happen at sentence boundaries, not fixed character counts — keeps each chunk topically coherent for better embedding/retrieval quality |
-| **MetadataAwareChunker** | One chunk per MSMARCO-XI passage, tagged with `query_id`/`passage_id`/`language`/`is_selected` | MSMARCO-XI passages are already human-relevance-labeled — re-chunking would throw away that signal; keeping them whole preserves metadata for later retrieval boosting |
-| **RecursiveChunker** | Paragraph-first, recursively falls back to sentences for oversized paragraphs, then greedily repacks pieces up to `max_chunk_size` | **Production default** (used by `src/api.py` and the benchmark): respects real document structure, degrades gracefully for dense text, keeps chunk count low without truncating mid-sentence |
+| **MetadataAwareChunker** | One chunk per MSMARCO-XI passage, tagged with `query_id`/`passage_id`/`language`/`is_selected` | **Production default for MSMARCO-XI** (used by `src/api.py` and `benchmarks/run_eval.py`): passages are already short and self-contained, so re-splitting them would only discard the `is_selected` label the eval set scores against |
+| **RecursiveChunker** | Paragraph-first, recursively falls back to sentences for oversized paragraphs, then greedily repacks pieces up to `max_chunk_size` | Default for free-form documents (the `data/sample_corpus.json` fallback): respects real document structure, degrades gracefully for dense text, keeps chunk count low without truncating mid-sentence |
+
+Sentence-boundary detection for the sentence-based strategies lives in `src/text.py`, shared with the
+grounding guardrail and answer streaming. It matches the Indic and Urdu terminators (`।`, `॥`, `۔`, `؟`)
+alongside `.!?` — Hindi ends sentences with a danda, so a Latin-only `[.!?]` split would treat an entire
+multi-sentence Hindi passage or answer as one sentence.
 
 `scripts/compare_chunkers.py` runs all four on `data/sample_corpus.json` and prints chunk count, avg
 length, and a sample chunk per strategy — useful for eyeballing the tradeoffs on real content.
@@ -140,6 +195,63 @@ Every refusal — from any layer — returns the same canned message, so the use
    and checks max cosine similarity against the retrieved chunks. If more than 30% of sentences aren't
    supported by any retrieved passage, the whole answer is discarded — catches hallucination that slips
    past relevance filtering.
+
+## Full-request latency tracing (`src/latency.py`, `benchmarks/run_latency_trace.py`)
+
+Every request carries a `RequestTrace` whose `total_ms` is **measured independently** — wall clock from
+ASGI entry to response flush, owned by `LatencyTraceMiddleware` — with `unaccounted_ms` as the residual
+`total_ms - sum(spans)`.
+
+This inverts the earlier breakdown, which defined `total_ms` as the sum of the stages it happened to
+measure. That arithmetic cannot surface missing time even in principle: an untraced stage just shrinks the
+reported total to match. In practice it was hiding ~958ms per voice request — mostly the Sarvam STT round
+trip, which was timed all along and then omitted from the log line while still counting into the total.
+Now unattributed time has nowhere to hide, and `unaccounted_ms` near zero is the invariant that says the
+trace is honest.
+
+Spans are flat and non-overlapping. Overlapping aggregates (`llm_ttft_ms`, which spans `llm_network` +
+`llm_client_wait`) are recorded as *details* instead, so they can't double-count into the residual.
+
+```
+middleware · body_parse · stt_network · cache_lookup · query_preprocessing
+embedding_cache · embedding_compute · vector_search · reranking · retrieval_overhead
+relevance_guard · context_build · llm_network · llm_client_wait · llm_generation
+llm_retry_wait · grounding_guard · serialization · response_write
+unaccounted · total
+```
+
+There is no `auth_ms` or `db_ms`: this service has no authentication and no database. Reporting a
+fabricated `0.0` for stages that don't exist would be worse than their absence.
+
+```bash
+venv/bin/python benchmarks/run_latency_trace.py            # text path: 1 cold, 20 warm, 20 cached
+venv/bin/python benchmarks/run_latency_trace.py --voice    # audio path (measures the STT round trip)
+```
+
+Writes [`benchmarks/latency_trace_text.md`](benchmarks/latency_trace_text.md) and
+[`benchmarks/latency_trace_voice.md`](benchmarks/latency_trace_voice.md). Both drive the real ASGI app, so
+middleware, multipart parsing, serialization, and flush are all inside the numbers.
+
+**Two things the benchmark controls for, because both silently corrupt latency numbers:**
+
+- *Provider rate limits.* Groq's free tier caps **tokens**, not requests (measured 8000 TPM against ~850
+  tokens/request ≈ 9 requests/min). Unpaced, 20 back-to-back requests trip it and the 429 retry backoff is
+  measured as pipeline latency: one such run reported a warm p95 of 3933ms, of which 3220ms was backoff.
+  `--delay` (default 7s) paces requests; the backoff that does occur is now attributed to
+  `llm_retry_wait` rather than left in the residual.
+- *CPU frequency state.* That same pacing inflates every CPU-bound span. A ~5ms forward pass is too small
+  a burst to make an idled CPU ramp back up, so the identical encode measures **4.8ms back-to-back and
+  22ms after a 7s gap**. Neither is wrong; they bound different traffic shapes. The report measures
+  embedding under both conditions rather than picking the flattering one.
+
+### Latency-relevant configuration
+
+| Variable | Default | Why |
+|---|---|---|
+| `EMBEDDING_DEVICE` | `cpu` | MPS is ~1.6x faster for the startup index build but far worse per query — measured p50 115ms / p95 226ms for a query arriving after idle, vs 26ms / 35ms on CPU, because each new padded input shape compiles a fresh Metal kernel. CPU and MPS vectors agree to cosine 1.000000, so switching does not invalidate a persisted index. |
+| `EMBEDDING_TORCH_THREADS` | `1` | Required, not tuning: `faiss-cpu` bundles its own `libomp.dylib` and multi-threaded CPU torch alongside it **SIGSEGVs** on macOS/arm64. Also costs nothing — p50 is within noise across 1–8 threads at batch size 1. |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` | The previous default `llama-3.1-8b-instant` is decommissioned (404). |
+| `TRACE_BUFFER_SIZE` | `0` (off) | Ring buffer of completed traces at `GET /metrics/traces`, including the post-handler spans a response body cannot report about itself. |
 
 ## Latency methodology (`benchmarks/`)
 
@@ -180,10 +292,21 @@ venv/bin/python benchmarks/run_benchmark.py
 |---|---|
 | `GET /health` | `{"status": "ok"}` — frontend checks this before allowing recording |
 | `POST /query` | multipart field `audio` → runs `PipelineHarness.run`, returns `PipelineResult` JSON |
+| `POST /query/text` | `{"query": "..."}` → same pipeline, skipping STT. The only path that can meet a sub-200ms budget |
+| `POST /query/stream` | multipart field `audio` → Server-Sent Events, one grounding-checked sentence at a time |
+| `GET /metrics/cache` | embedding- and answer-cache hit/miss counters |
+| `GET /metrics/traces` | recent completed request traces (needs `TRACE_BUFFER_SIZE`) |
 
 ```bash
 curl -X POST http://localhost:8000/query -F "audio=@question.wav"
+curl -X POST http://localhost:8000/query/text -H 'content-type: application/json' \
+     -d '{"query":"what is retrieval augmented generation"}'
 ```
+
+`POST /query` and `/query/stream` cannot be brought under 200ms: transcription is a round trip to Sarvam
+(measured p50 268ms / p95 453ms on a 1-second clip) and the query isn't known until it completes, so even
+an answer-cache hit costs the full STT time — the measured cached *voice* path is p50 230ms. Only
+`/query/text` can skip it.
 
 ## Testing
 
@@ -196,7 +319,8 @@ venv/bin/python -m pytest tests/ -q
 ```
 voice-rag/
   src/
-    api.py              # FastAPI app: GET /health, POST /query
+    api.py              # FastAPI app + LatencyTraceMiddleware (owns total_ms)
+    latency.py          # RequestTrace — flat spans, measured total, unaccounted residual
     harness.py          # PipelineHarness — orchestrates every stage below
     stt.py               # SarvamSTT + MockSTT
     chunking.py          # 4 chunking strategies + ChunkerRegistry
@@ -204,12 +328,16 @@ voice-rag/
     retrieval.py         # Retriever — rerank + low-confidence query rewrite
     guardrails.py        # InputGuardrail / RelevanceGuardrail / GroundingGuardrail
     generation.py        # Generator — swappable GroqProvider / AnthropicProvider
-    data_loader.py       # ai4bharat/MSMARCO-XI streaming loader (separate from the demo corpus below)
+    data_loader.py       # ai4bharat/MSMARCO-XI loader — the corpus the API serves
+    text.py              # shared sentence-boundary detection (Latin + Indic terminators)
     pipeline.py          # skeleton, superseded by api.py + harness.py — not implemented
     config.py            # skeleton, not implemented
   frontend/              # Next.js (App Router, TS) — single-page recorder UI
-  data/sample_corpus.json  # small demo corpus, indexed by the live API and benchmark
+  data/
+    msmarco_xi_cache/    # generated: cached dataset slices (gitignored)
+    eval_set.json        # generated: labeled retrieval cases from is_selected
+    sample_corpus.json   # small demo corpus — offline fallback only
   scripts/               # inspect_dataset.py, compare_chunkers.py — dev tools
-  benchmarks/            # run_benchmark.py + generated latency_report.md
+  benchmarks/            # run_benchmark.py (latency) + run_eval.py (retrieval accuracy)
   tests/
 ```

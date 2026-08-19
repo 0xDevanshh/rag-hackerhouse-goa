@@ -13,26 +13,49 @@ Two responsibilities:
 """
 
 import asyncio
+import json
+import logging
 import os
-import re
 import time
-from contextlib import contextmanager
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
 
+import numpy as np
 import requests
 from pydantic import BaseModel, Field
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from src import stt
 from src.chunking import Chunk
-from src.generation import Generator
+from src.generation import DEFAULT_MAX_TOKENS, SYSTEM_PROMPT, Generator, _build_user_message
 from src.guardrails import REFUSAL_RESPONSE, GroundingGuardrail, GuardResult, InputGuardrail, RelevanceGuardrail
+from src.latency import RequestTrace
 from src.retrieval import Retriever, RetrievalResult
-from src.vectorstore import VectorStore
+from src.text import SENTENCE_BOUNDARY_RE as _SENTENCE_BOUNDARY_RE
+from src.vectorstore import DEFAULT_EMBEDDING_MODEL_NAME, VectorStore, text_fingerprint
+
+logger = logging.getLogger(__name__)
 
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])\s+")
+_RESULT_CACHE_MAX_SIZE = int(os.environ.get("RESULT_CACHE_MAX_SIZE", "512"))
+
+# Bumped by hand whenever SYSTEM_PROMPT or the context-block format changes in
+# a way that would make a previously cached answer wrong to serve. Part of the
+# answer cache key: without it, editing the prompt leaves every prior answer
+# in the cache being served as if it had been generated under the new prompt.
+PROMPT_VERSION = "1"
+
+# Retrieval sub-timings that Retriever.retrieve reports and that the trace
+# records as flat, non-overlapping spans.
+_RETRIEVAL_SPANS = ("embedding_cache", "embedding_compute", "vector_search", "reranking")
+
+
+# Note on normalization: the answer cache keys off text_fingerprint(), which
+# applies src.vectorstore.normalize_text() before hashing. That is deliberate
+# sharing rather than duplication — the answer cache and the embedding cache
+# must agree on what counts as "the same query", or a query could hit one and
+# miss the other.
 
 
 def _is_transient_stt_error(exc: BaseException) -> bool:
@@ -59,25 +82,6 @@ class StageError(BaseModel):
     message: str
 
 
-class StageTiming(BaseModel):
-    """Start/end timestamps and duration for one pipeline stage."""
-
-    stage: str
-    started_at: float
-    ended_at: float
-    duration_ms: float
-
-
-class LatencyTrace(BaseModel):
-    """Ordered timings for every stage that ran during one PipelineHarness.run() call."""
-
-    stages: list[StageTiming] = Field(default_factory=list)
-
-    def total_duration_ms(self) -> float:
-        """Sum of all recorded stage durations, in milliseconds."""
-        return sum(stage.duration_ms for stage in self.stages)
-
-
 class PipelineResult(BaseModel):
     """The outcome of one PipelineHarness.run() call."""
 
@@ -85,10 +89,18 @@ class PipelineResult(BaseModel):
     query_text: str = ""
     sources: list[Chunk] = Field(default_factory=list)
     scores: list[float] = Field(default_factory=list)
-    latency_trace: LatencyTrace
+    # Full-lifecycle wall-clock trace. Replaces the previous LatencyTrace,
+    # whose total_ms was defined as the sum of the stages it happened to
+    # measure — an arithmetic that could not, even in principle, surface the
+    # ~958ms of real request time that was going unattributed. See
+    # src/latency.py.
+    trace: RequestTrace = Field(default_factory=RequestTrace)
     guard_flags: dict[str, GuardResult] = Field(default_factory=dict)
     degraded: bool = False
     errors: list[StageError] = Field(default_factory=list)
+    # True when this response came from the answer cache rather than from a
+    # fresh retrieval + generation.
+    cached: bool = False
 
 
 class StreamSentenceEvent(BaseModel):
@@ -137,6 +149,7 @@ class PipelineHarness:
         grounding_guardrail: GroundingGuardrail | None = None,
         max_retries: int = 2,
         retry_wait_multiplier: float = 1.0,
+        scope: str = "public",
     ):
         """
         Args:
@@ -158,6 +171,13 @@ class PipelineHarness:
             retry_wait_multiplier: exponential-backoff base multiplier for
                 STT retries, in seconds. Lower this in tests to avoid slow
                 sleeps.
+            scope: isolation scope mixed into every answer cache key. This
+                project has no authentication or multi-tenancy, so the
+                default single "public" scope is the honest description of
+                what it serves — but the parameter exists so that adding a
+                per-user, per-workspace, or per-repository scope later is a
+                matter of passing it in, not of retrofitting isolation onto
+                keys that never had it. See _result_cache_key.
         """
         self.store = store
         self.chunks = chunks or []
@@ -169,23 +189,87 @@ class PipelineHarness:
         self.retriever = Retriever(store)
         self.max_retries = max_retries
         self.retry_wait_multiplier = retry_wait_multiplier
+        self.scope = scope
+        # Exact-query answer cache: skips retrieval+guardrails+generation
+        # entirely for a repeated (already-transcribed) query text.
+        #
+        # Never caches degraded results (transient technical failures should
+        # be retried, not replayed). LRU rather than FIFO, so a genuinely hot
+        # query isn't evicted on schedule by a stream of one-off ones.
+        #
+        # Process-local: this project has no Redis. That is a real limitation
+        # for a multi-instance deployment (each instance misses on the others'
+        # hits, and the effective hit rate divides by the instance count), and
+        # the fix is a shared store, not a bigger local dict. The key is
+        # already fully explicit — see _result_cache_key — so it ports as-is.
+        self._result_cache: "OrderedDict[tuple, PipelineResult]" = OrderedDict()
+        self._index_version = 0
 
-    @staticmethod
-    @contextmanager
-    def _timed(latency_trace: LatencyTrace, stage: str):
-        started_at = time.time()
+    def _result_cache_key(self, query_text: str, scope: str | None = None) -> tuple:
+        """
+        Fully-qualified answer cache key.
+
+        Every component is something that, if it changed, would make a
+        previously cached answer wrong to serve:
+
+        - scope: isolation boundary. Guarantees one scope can never be served
+          another's cached answer, even for a byte-identical query.
+        - index_version: a monotonic counter bumped on every (re)index. A
+          counter rather than id(self.store.index) because a freed object's
+          id() can be reused by a later object at the same address, which
+          would risk a stale hit against a different corpus.
+        - embedding model: different vectors mean different retrieval, which
+          means a different grounded answer for the same words.
+        - generation model + prompt version + max tokens: the answer text is a
+          function of these, so a model swap or prompt edit must invalidate.
+        - query fingerprint: a digest of the normalized query, so key size
+          doesn't grow with query length.
+        """
+        return (
+            scope if scope is not None else self.scope,
+            self._index_version,
+            getattr(self.store.embedder, "model_name", DEFAULT_EMBEDDING_MODEL_NAME),
+            getattr(getattr(self.generator, "provider", None), "model", "unknown"),
+            PROMPT_VERSION,
+            DEFAULT_MAX_TOKENS,
+            text_fingerprint(query_text),
+        )
+
+    async def prewarm(self) -> dict[str, float]:
+        """
+        Pay every one-time initialization cost at process startup instead of
+        inside the first user request, and report what each cost.
+
+        Covers the three cold-start costs measured in this pipeline:
+        the embedding model's lazy initialization (~690ms on the first
+        encode, plus a fresh cost per novel input shape on MPS), the LLM
+        provider's DNS/TCP/TLS handshake (~80ms), and the STT provider's
+        (~100ms). Together that is roughly 0.9s that the first request after
+        every deploy would otherwise absorb.
+
+        Safe to call more than once; each step is idempotent.
+        """
+        timings: dict[str, float] = {}
+        timings["embedder_warmup_ms"] = await asyncio.to_thread(self.store.embedder.warmup)
+        # The grounding guardrail may hold a different Embedder instance (and
+        # therefore a different model/device pair); warm that one too rather
+        # than assume they share.
+        guard_embedder = getattr(self.grounding_guardrail, "embedder", None)
+        if guard_embedder is not None and guard_embedder is not self.store.embedder:
+            timings["grounding_embedder_warmup_ms"] = await asyncio.to_thread(guard_embedder.warmup)
         try:
-            yield
-        finally:
-            ended_at = time.time()
-            latency_trace.stages.append(
-                StageTiming(stage=stage, started_at=started_at, ended_at=ended_at, duration_ms=(ended_at - started_at) * 1000)
-            )
+            timings["llm_prewarm_ms"] = await self.generator.prewarm()
+        except Exception as exc:
+            logger.warning("LLM prewarm skipped (%s)", exc)
+        if self.stt_client is not None:
+            timings["stt_prewarm_ms"] = await asyncio.to_thread(self.stt_client.prewarm)
+        logger.info("prewarm: %s", " ".join(f"{k}={v:.1f}" for k, v in timings.items()))
+        return timings
 
-    def _run_stage(self, stage: str, latency_trace: LatencyTrace, errors: list[StageError], fn, *args):
+    def _run_stage(self, stage: str, trace: RequestTrace, errors: list[StageError], fn, *args):
         """Run a synchronous, non-retried stage; record its timing; capture failures as a StageError."""
         try:
-            with self._timed(latency_trace, stage):
+            with trace.span(stage):
                 return fn(*args)
         except Exception as exc:
             errors.append(StageError(stage=stage, error_type=type(exc).__name__, message=str(exc)))
@@ -227,44 +311,163 @@ class PipelineHarness:
         audio_input: str | bytes,
         filename: str,
         content_type: str | None,
-        latency_trace: LatencyTrace,
+        trace: RequestTrace,
         errors: list[StageError],
     ) -> str | None:
+        """
+        Transcribe audio via the STT provider.
+
+        Recorded as "stt_network" rather than "stt" because that is what it
+        is: a round trip to api.sarvam.ai, measured at 250-525ms on a
+        one-second clip and longer on real speech. This single span is the
+        bulk of the ~958ms that the previous breakdown left unexplained — it
+        was timed all along, and then simply omitted from the log line while
+        still being counted into total_ms.
+        """
         try:
-            with self._timed(latency_trace, "stt"):
+            with trace.span("stt_network"):
                 return await asyncio.to_thread(self._transcribe_with_retry, audio_input, filename, content_type)
         except Exception as exc:
             errors.append(StageError(stage="stt", error_type=type(exc).__name__, message=str(exc)))
             return None
 
-    def _retrieve_stage(self, query_text: str, latency_trace: LatencyTrace, errors: list[StageError]) -> RetrievalResult | None:
+    async def _retrieve_stage(
+        self,
+        query_text: str,
+        trace: RequestTrace,
+        errors: list[StageError],
+    ) -> RetrievalResult | None:
+        """
+        Embed the query, search, and rerank — off the event loop.
+
+        Runs in a worker thread via asyncio.to_thread. Embedding is a
+        CPU-bound torch forward pass and FAISS search holds the GIL; calling
+        them directly from an async handler blocks the whole event loop, so
+        under any concurrency every other in-flight request stalls behind
+        them. That did not show up in a one-request-at-a-time trace, which is
+        exactly why it survived.
+
+        Sub-timings arrive as flat, non-overlapping spans
+        (embedding_cache / embedding_compute / vector_search / reranking), and
+        whatever wall clock the stage spent outside them — thread dispatch,
+        result marshalling — is recorded as retrieval_overhead rather than
+        being silently dropped into the residual.
+        """
+        timing: dict[str, float] = {}
+        stage_ms = 0.0
         try:
             if self.store.index is None or self.store.index.ntotal == 0:
-                with self._timed(latency_trace, "chunking"):
+                with trace.span("index_build"):
                     if not self.chunks:
                         raise RuntimeError("VectorStore is empty and no chunks were provided to index")
-                    self.store.build(self.chunks)
-            with self._timed(latency_trace, "retrieval"):
-                return self.retriever.retrieve(query_text)
+                    await asyncio.to_thread(self.store.build, self.chunks)
+                    self._index_version += 1
+
+            started = time.perf_counter()
+            try:
+                return await asyncio.to_thread(self.retriever.retrieve, query_text, timing)
+            finally:
+                stage_ms = (time.perf_counter() - started) * 1000
         except Exception as exc:
             errors.append(StageError(stage="retrieval", error_type=type(exc).__name__, message=str(exc)))
             return None
+        finally:
+            accounted = 0.0
+            for name in _RETRIEVAL_SPANS:
+                value = timing.get(f"{name}_ms")
+                if value is not None:
+                    trace.add(name, value)
+                    accounted += value
+            # Whatever the stage spent outside its own sub-timings: thread
+            # dispatch, language detection, result marshalling. Recorded
+            # explicitly so it shows up as retrieval overhead rather than
+            # inflating the request-level unaccounted_ms, where it would be
+            # indistinguishable from genuinely un-instrumented work.
+            overhead = stage_ms - accounted
+            if overhead > 0:
+                trace.add("retrieval_overhead", overhead)
+            passes = timing.get("search_passes")
+            if passes:
+                trace.label("retrieval_passes", int(passes))
+
+    async def _chunk_vectors_for(self, retrieval_result: RetrievalResult) -> np.ndarray | None:
+        """
+        Embeddings for the retrieved chunks, read back out of the FAISS index.
+
+        These are the vectors GroundingGuardrail needs. They were computed
+        once when the index was built, so recovering them is a memory copy —
+        versus 17-23ms of redundant model inference per request (and once per
+        *sentence* on the streaming path) to re-encode text whose vector
+        already exists. Returns None if positions aren't available, in which
+        case the guardrail falls back to encoding as before.
+        """
+        if not retrieval_result.positions:
+            return None
+        try:
+            return await asyncio.to_thread(self.store.embeddings_for, retrieval_result.positions)
+        except Exception as exc:
+            logger.warning("could not reconstruct chunk embeddings (%s); falling back to re-encoding", exc)
+            return None
 
     async def _generate_stage(
-        self, query_text: str, retrieval_result: RetrievalResult, latency_trace: LatencyTrace, errors: list[StageError]
+        self,
+        query_text: str,
+        retrieval_result: RetrievalResult,
+        trace: RequestTrace,
+        errors: list[StageError],
     ) -> str | None:
+        """
+        Build the prompt and generate, recording context_build / llm_network /
+        llm_client_wait / llm_generation as separate spans.
+
+        Generation goes over the streaming transport even here on the
+        non-streaming route, so llm_ttft_ms is always observable — see
+        LLMProvider.answer_streamed for why that costs nothing measurable.
+        """
+        retrieved_chunks = list(zip(retrieval_result.chunks, retrieval_result.scores))
+        with trace.span("context_build"):
+            user_message = _build_user_message(query_text, retrieved_chunks)
+            trace.label("prompt_chars", len(SYSTEM_PROMPT) + len(user_message))
+
+        timing: dict[str, float] = {}
         try:
-            with self._timed(latency_trace, "generation"):
-                retrieved_chunks = list(zip(retrieval_result.chunks, retrieval_result.scores))
-                return await self.generator.answer(query_text, retrieved_chunks)
+            return await self.generator.answer_streamed(query_text, retrieved_chunks, timing=timing)
         except Exception as exc:
             errors.append(StageError(stage="generation", error_type=type(exc).__name__, message=str(exc)))
             return None
+        finally:
+            self._record_llm_spans(trace, timing)
+
+    @staticmethod
+    def _record_llm_spans(trace: RequestTrace, timing: dict[str, Any]) -> None:
+        """
+        Move one LLM call's timings onto the trace: the consecutive slices as
+        spans, the overlapping aggregates as details, and the non-timing facts
+        (attempt count, provider finish reason) as labels.
+
+        llm_finish_reason matters for diagnosis rather than latency: a
+        `length` finish means the model was cut off at max_tokens, which for a
+        reasoning model can mean its reasoning consumed the budget and no
+        answer was emitted at all. That failure otherwise looks identical to a
+        legitimate "not enough information" refusal by the time it reaches the
+        guardrail.
+        """
+        for name in ("llm_network", "llm_client_wait", "llm_generation", "llm_retry_wait"):
+            value = timing.get(f"{name}_ms")
+            if value is not None:
+                trace.add(name, value)
+        for name in ("llm_ttft_ms", "llm_total_ms"):
+            if name in timing:
+                trace.detail(name[:-3], timing[name])
+        if timing.get("llm_attempts", 1) > 1:
+            trace.label("llm_attempts", int(timing["llm_attempts"]))
+        if timing.get("llm_finish_reason"):
+            trace.label("llm_finish_reason", str(timing["llm_finish_reason"]))
 
     def _degraded(
         self,
         answer: str,
-        latency_trace: LatencyTrace,
+        trace: RequestTrace,
         guard_flags: dict[str, GuardResult],
         errors: list[StageError],
         query_text: str = "",
@@ -276,14 +479,19 @@ class PipelineHarness:
             query_text=query_text,
             sources=sources or [],
             scores=scores or [],
-            latency_trace=latency_trace,
+            trace=trace,
             guard_flags=guard_flags,
             degraded=True,
             errors=errors,
         )
 
     async def run(
-        self, audio_or_text_input: str | bytes, filename: str = "audio.wav", content_type: str | None = None
+        self,
+        audio_or_text_input: str | bytes,
+        filename: str = "audio.wav",
+        content_type: str | None = None,
+        trace: RequestTrace | None = None,
+        scope: str | None = None,
     ) -> PipelineResult:
         """
         Run one request through the full pipeline.
@@ -303,125 +511,207 @@ class PipelineHarness:
                 with no resolvable Content-Type, so prefer passing this
                 (e.g. the browser upload's real Content-Type) over relying
                 on a guess from `filename`'s extension alone.
+            trace: an in-progress RequestTrace to record into — passed down by
+                the ASGI middleware so the trace's total_ms covers the whole
+                HTTP request (arrival, body parse, serialization, flush), not
+                just the part inside this method. One is created here if
+                omitted, e.g. when called from a benchmark.
+            scope: overrides the harness-level cache isolation scope for this
+                request.
 
         Returns:
-            PipelineResult: the final answer, its source chunks, a timing
-            trace, per-guardrail results, and whether the response is a
-            degraded fallback (a stage technically failed) rather than a
+            PipelineResult: the final answer, its source chunks, a full
+            lifecycle trace, per-guardrail results, and whether the response
+            is a degraded fallback (a stage technically failed) rather than a
             normal answer or guardrail refusal.
         """
-        latency_trace = LatencyTrace()
+        owns_trace = trace is None
+        if trace is None:
+            trace = RequestTrace()
+            trace.start()
         errors: list[StageError] = []
         guard_flags: dict[str, GuardResult] = {}
+
+        def finish(result: PipelineResult) -> PipelineResult:
+            if owns_trace:
+                trace.finish()
+            logger.info("%s", trace.render())
+            return result
 
         # Stage 1: STT (only if the input looks like audio)
         is_audio = isinstance(audio_or_text_input, (bytes, bytearray)) or (
             isinstance(audio_or_text_input, str) and _is_audio_path(audio_or_text_input)
         )
+        trace.label("input", "audio" if is_audio else "text")
         if is_audio:
-            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, latency_trace, errors)
+            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, trace, errors)
             if query_text is None:
-                return self._degraded(
-                    "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
-                    latency_trace,
-                    guard_flags,
-                    errors,
+                return finish(
+                    self._degraded(
+                        "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
+                        trace,
+                        guard_flags,
+                        errors,
+                    )
                 )
         else:
             query_text = audio_or_text_input
 
+        # Fast path: the answer cache, consulted before embedding, retrieval,
+        # or generation. For a text query this is the whole request; for audio
+        # it can only ever start after STT, since the query isn't known until
+        # the audio has been transcribed.
+        with trace.span("cache_lookup"):
+            cache_key = self._result_cache_key(query_text, scope)
+            cached = self._result_cache.get(cache_key)
+            if cached is not None:
+                self._result_cache.move_to_end(cache_key)  # LRU touch
+        if cached is not None:
+            trace.label("cache", "hit")
+            return finish(cached.model_copy(update={"trace": trace, "cached": True}))
+        trace.label("cache", "miss")
+
         # Stage 2: InputGuardrail
-        input_result = self._run_stage("input_guardrail", latency_trace, errors, self.input_guardrail.check, query_text)
+        input_result = self._run_stage("query_preprocessing", trace, errors, self.input_guardrail.check, query_text)
         if input_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
+            return finish(self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text))
         guard_flags["input"] = input_result
         if not input_result.allowed:
-            return PipelineResult(
+            result = PipelineResult(
                 answer=input_result.response_override or REFUSAL_RESPONSE,
                 query_text=query_text,
                 sources=[],
-                latency_trace=latency_trace,
+                trace=trace,
                 guard_flags=guard_flags,
                 degraded=False,
                 errors=errors,
             )
+            self._cache_result(cache_key, result)
+            return finish(result)
 
         # Stage 3: chunking/retrieval (chunking is skipped once the store is indexed)
-        retrieval_result = self._retrieve_stage(query_text, latency_trace, errors)
+        retrieval_result = await self._retrieve_stage(query_text, trace, errors)
         if retrieval_result is None:
-            return self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
+            return finish(self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text))
 
         # Stage 4: RelevanceGuardrail
         relevance_result = self._run_stage(
-            "relevance_guardrail", latency_trace, errors, self.relevance_guardrail.check, retrieval_result
+            "relevance_guard", trace, errors, self.relevance_guardrail.check, retrieval_result
         )
         if relevance_result is None:
-            return self._degraded(
-                REFUSAL_RESPONSE, latency_trace, guard_flags, errors,
-                query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            return finish(
+                self._degraded(
+                    REFUSAL_RESPONSE, trace, guard_flags, errors,
+                    query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+                )
             )
         guard_flags["relevance"] = relevance_result
         if not relevance_result.allowed:
-            return PipelineResult(
+            result = PipelineResult(
                 answer=relevance_result.response_override or REFUSAL_RESPONSE,
                 query_text=query_text,
                 sources=retrieval_result.chunks,
                 scores=retrieval_result.scores,
-                latency_trace=latency_trace,
+                trace=trace,
                 guard_flags=guard_flags,
                 degraded=False,
                 errors=errors,
             )
+            self._cache_result(cache_key, result)
+            return finish(result)
 
-        # Stage 5: Generator.answer (retries happen inside Generator/LLMProvider)
-        answer_text = await self._generate_stage(query_text, retrieval_result, latency_trace, errors)
+        # Stage 5: generation, concurrent with grounding-vector preparation.
+        #
+        # The vectors the grounding guardrail will need depend only on which
+        # chunks were retrieved — not on the answer — so there is no reason to
+        # wait for the LLM before preparing them. asyncio.gather overlaps the
+        # two. (With FAISS reconstruction the prep is now near-instant, so the
+        # overlap saves little in absolute terms; it is kept because it makes
+        # the dependency structure explicit, and because the fallback path
+        # inside _chunk_vectors_for — re-encoding chunk texts when positions
+        # aren't available — is the 17-23ms case this actually hides.)
+        answer_text, chunk_vectors = await asyncio.gather(
+            self._generate_stage(query_text, retrieval_result, trace, errors),
+            self._chunk_vectors_for(retrieval_result),
+        )
         if answer_text is None:
-            return self._degraded(
-                "I'm having trouble generating an answer right now. Please try again shortly.",
-                latency_trace,
-                guard_flags,
-                errors,
-                query_text=query_text,
-                sources=retrieval_result.chunks,
-                scores=retrieval_result.scores,
+            return finish(
+                self._degraded(
+                    "I'm having trouble generating an answer right now. Please try again shortly.",
+                    trace,
+                    guard_flags,
+                    errors,
+                    query_text=query_text,
+                    sources=retrieval_result.chunks,
+                    scores=retrieval_result.scores,
+                )
             )
 
         # Stage 6: GroundingGuardrail
         grounding_result = self._run_stage(
-            "grounding_guardrail", latency_trace, errors, self.grounding_guardrail.check, answer_text, retrieval_result.chunks
+            "grounding_guard",
+            trace,
+            errors,
+            self.grounding_guardrail.check,
+            answer_text,
+            retrieval_result.chunks,
+            chunk_vectors,
         )
         if grounding_result is None:
-            return self._degraded(
-                REFUSAL_RESPONSE, latency_trace, guard_flags, errors,
-                query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            return finish(
+                self._degraded(
+                    REFUSAL_RESPONSE, trace, guard_flags, errors,
+                    query_text=query_text, sources=retrieval_result.chunks, scores=retrieval_result.scores,
+                )
             )
         guard_flags["grounding"] = grounding_result
         if not grounding_result.allowed:
-            return PipelineResult(
+            result = PipelineResult(
                 answer=grounding_result.response_override or REFUSAL_RESPONSE,
                 query_text=query_text,
                 sources=retrieval_result.chunks,
                 scores=retrieval_result.scores,
-                latency_trace=latency_trace,
+                trace=trace,
                 guard_flags=guard_flags,
                 degraded=False,
                 errors=errors,
             )
+            self._cache_result(cache_key, result)
+            return finish(result)
 
         # Final response
-        return PipelineResult(
+        result = PipelineResult(
             answer=answer_text,
             query_text=query_text,
             sources=retrieval_result.chunks,
             scores=retrieval_result.scores,
-            latency_trace=latency_trace,
+            trace=trace,
             guard_flags=guard_flags,
             degraded=False,
             errors=errors,
         )
+        self._cache_result(cache_key, result)
+        return finish(result)
+
+    def _cache_result(self, cache_key: tuple, result: PipelineResult) -> None:
+        """
+        Store a result under `cache_key`, evicting least-recently-used entries
+        first. Degraded results are never cached: they represent transient
+        technical failures, which should be retried rather than replayed.
+        """
+        if result.degraded:
+            return
+        while len(self._result_cache) >= _RESULT_CACHE_MAX_SIZE:
+            self._result_cache.popitem(last=False)
+        self._result_cache[cache_key] = result
 
     async def run_streaming(
-        self, audio_or_text_input: str | bytes, filename: str = "audio.wav", content_type: str | None = None
+        self,
+        audio_or_text_input: str | bytes,
+        filename: str = "audio.wav",
+        content_type: str | None = None,
+        trace: RequestTrace | None = None,
+        scope: str | None = None,
     ) -> AsyncIterator[StreamSentenceEvent | StreamDoneEvent]:
         """
         Streaming counterpart to run(). STT, InputGuardrail,
@@ -439,100 +729,153 @@ class PipelineHarness:
         ready, followed by exactly one StreamDoneEvent carrying the final
         PipelineResult (built from only the accepted sentences).
         """
-        latency_trace = LatencyTrace()
+        owns_trace = trace is None
+        if trace is None:
+            trace = RequestTrace()
+            trace.start()
         errors: list[StageError] = []
         guard_flags: dict[str, GuardResult] = {}
+
+        def log(result: PipelineResult) -> None:
+            if owns_trace:
+                trace.finish()
+            logger.info("%s", trace.render())
 
         # Stage 1: STT
         is_audio = isinstance(audio_or_text_input, (bytes, bytearray)) or (
             isinstance(audio_or_text_input, str) and _is_audio_path(audio_or_text_input)
         )
+        trace.label("input", "audio" if is_audio else "text")
         if is_audio:
-            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, latency_trace, errors)
+            query_text = await self._transcribe_stage(audio_or_text_input, filename, content_type, trace, errors)
             if query_text is None:
-                yield StreamDoneEvent(
-                    result=self._degraded(
-                        "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
-                        latency_trace,
-                        guard_flags,
-                        errors,
-                    )
+                result = self._degraded(
+                    "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
+                    trace,
+                    guard_flags,
+                    errors,
                 )
+                log(result)
+                yield StreamDoneEvent(result=result)
                 return
         else:
             query_text = audio_or_text_input
 
+        with trace.span("cache_lookup"):
+            cache_key = self._result_cache_key(query_text, scope)
+            cached = self._result_cache.get(cache_key)
+            if cached is not None:
+                self._result_cache.move_to_end(cache_key)
+        if cached is not None:
+            trace.label("cache", "hit")
+            result = cached.model_copy(update={"trace": trace, "cached": True})
+            log(result)
+            if result.answer:
+                yield StreamSentenceEvent(text=result.answer)
+            yield StreamDoneEvent(result=result)
+            return
+        trace.label("cache", "miss")
+
         # Stage 2: InputGuardrail
-        input_result = self._run_stage("input_guardrail", latency_trace, errors, self.input_guardrail.check, query_text)
+        input_result = self._run_stage("query_preprocessing", trace, errors, self.input_guardrail.check, query_text)
         if input_result is None:
-            yield StreamDoneEvent(
-                result=self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
-            )
+            result = self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text)
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
         guard_flags["input"] = input_result
         if not input_result.allowed:
-            yield StreamDoneEvent(
-                result=PipelineResult(
-                    answer=input_result.response_override or REFUSAL_RESPONSE,
-                    query_text=query_text,
-                    sources=[],
-                    latency_trace=latency_trace,
-                    guard_flags=guard_flags,
-                    degraded=False,
-                    errors=errors,
-                )
+            result = PipelineResult(
+                answer=input_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
+                sources=[],
+                trace=trace,
+                guard_flags=guard_flags,
+                degraded=False,
+                errors=errors,
             )
+            self._cache_result(cache_key, result)
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
 
         # Stage 3: chunking/retrieval
-        retrieval_result = self._retrieve_stage(query_text, latency_trace, errors)
+        retrieval_result = await self._retrieve_stage(query_text, trace, errors)
         if retrieval_result is None:
-            yield StreamDoneEvent(
-                result=self._degraded(REFUSAL_RESPONSE, latency_trace, guard_flags, errors, query_text=query_text)
-            )
+            result = self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text)
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
 
         # Stage 4: RelevanceGuardrail
         relevance_result = self._run_stage(
-            "relevance_guardrail", latency_trace, errors, self.relevance_guardrail.check, retrieval_result
+            "relevance_guard", trace, errors, self.relevance_guardrail.check, retrieval_result
         )
         if relevance_result is None:
-            yield StreamDoneEvent(
-                result=self._degraded(
-                    REFUSAL_RESPONSE,
-                    latency_trace,
-                    guard_flags,
-                    errors,
-                    query_text=query_text,
-                    sources=retrieval_result.chunks,
-                    scores=retrieval_result.scores,
-                )
+            result = self._degraded(
+                REFUSAL_RESPONSE,
+                trace,
+                guard_flags,
+                errors,
+                query_text=query_text,
+                sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
             )
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
         guard_flags["relevance"] = relevance_result
         if not relevance_result.allowed:
-            yield StreamDoneEvent(
-                result=PipelineResult(
-                    answer=relevance_result.response_override or REFUSAL_RESPONSE,
-                    query_text=query_text,
-                    sources=retrieval_result.chunks,
-                    scores=retrieval_result.scores,
-                    latency_trace=latency_trace,
-                    guard_flags=guard_flags,
-                    degraded=False,
-                    errors=errors,
-                )
+            result = PipelineResult(
+                answer=relevance_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
+                sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
+                trace=trace,
+                guard_flags=guard_flags,
+                degraded=False,
+                errors=errors,
             )
+            self._cache_result(cache_key, result)
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
 
         # Stage 5: streaming generation, with per-sentence grounding as each one completes
         retrieved_chunks = list(zip(retrieval_result.chunks, retrieval_result.scores))
+        with trace.span("context_build"):
+            user_message = _build_user_message(query_text, retrieved_chunks)
+            trace.label("prompt_chars", len(SYSTEM_PROMPT) + len(user_message))
+
+        # Prepared once, before the stream opens, and reused for every
+        # sentence check below. Previously each is_sentence_grounded() call
+        # re-encoded all five chunk texts, so a five-sentence answer paid that
+        # ~17-23ms five times — and paid it *inside* the stream loop, delaying
+        # each sentence's delivery to the client.
+        chunk_vectors = await self._chunk_vectors_for(retrieval_result)
+
         accepted_sentences: list[str] = []
         dropped_count = 0
         buffer = ""
-        started_at = time.time()
+        llm_timing: dict[str, float] = {}
+        grounding_ms = 0.0
+
+        async def grounded(sentence: str) -> bool:
+            """Grounding-check one sentence off the event loop, accumulating its cost."""
+            nonlocal grounding_ms
+            started = time.perf_counter()
+            try:
+                return await asyncio.to_thread(
+                    self.grounding_guardrail.is_sentence_grounded,
+                    sentence,
+                    retrieval_result.chunks,
+                    chunk_vectors,
+                )
+            finally:
+                grounding_ms += (time.perf_counter() - started) * 1000
+
         try:
-            async for delta in self.generator.stream_answer(query_text, retrieved_chunks):
+            async for delta in self.generator.stream_answer(query_text, retrieved_chunks, timing=llm_timing):
                 buffer += delta
                 while True:
                     match = _SENTENCE_BOUNDARY_RE.search(buffer)
@@ -541,14 +884,14 @@ class PipelineHarness:
                     sentence, buffer = buffer[: match.end()].strip(), buffer[match.end() :]
                     if not sentence:
                         continue
-                    if self.grounding_guardrail.is_sentence_grounded(sentence, retrieval_result.chunks):
+                    if await grounded(sentence):
                         accepted_sentences.append(sentence)
                         yield StreamSentenceEvent(text=sentence)
                     else:
                         dropped_count += 1
             trailing = buffer.strip()
             if trailing:
-                if self.grounding_guardrail.is_sentence_grounded(trailing, retrieval_result.chunks):
+                if await grounded(trailing):
                     accepted_sentences.append(trailing)
                     yield StreamSentenceEvent(text=trailing)
                 else:
@@ -556,10 +899,20 @@ class PipelineHarness:
         except Exception as exc:
             errors.append(StageError(stage="generation", error_type=type(exc).__name__, message=str(exc)))
         finally:
-            ended_at = time.time()
-            latency_trace.stages.append(
-                StageTiming(stage="generation", started_at=started_at, ended_at=ended_at, duration_ms=(ended_at - started_at) * 1000)
-            )
+            self._record_llm_spans(trace, llm_timing)
+            if grounding_ms:
+                # Per-sentence grounding is interleaved with generation here,
+                # not sequential after it: the loop above blocks the stream
+                # read while it checks each completed sentence. So the
+                # grounding cost is *inside* the llm_generation wall clock, and
+                # recording both at face value would overlap them and push the
+                # request residual negative by exactly this much. Splitting it
+                # out of llm_generation keeps the spans flat and the residual
+                # meaningful.
+                trace.add("grounding_guard", grounding_ms)
+                for span in trace.spans:
+                    if span.name == "llm_generation":
+                        span.duration_ms = max(0.0, span.duration_ms - grounding_ms)
 
         if not accepted_sentences:
             fallback = (
@@ -567,40 +920,49 @@ class PipelineHarness:
                 if errors and errors[-1].stage == "generation"
                 else REFUSAL_RESPONSE
             )
-            yield StreamDoneEvent(
-                result=self._degraded(
-                    fallback,
-                    latency_trace,
-                    guard_flags,
-                    errors,
-                    query_text=query_text,
-                    sources=retrieval_result.chunks,
-                    scores=retrieval_result.scores,
-                )
+            result = self._degraded(
+                fallback,
+                trace,
+                guard_flags,
+                errors,
+                query_text=query_text,
+                sources=retrieval_result.chunks,
+                scores=retrieval_result.scores,
             )
+            log(result)
+            yield StreamDoneEvent(result=result)
             return
 
         guard_flags["grounding"] = GuardResult(
             allowed=True,
             reason="ok" if dropped_count == 0 else f"dropped_{dropped_count}_ungrounded_sentence(s)",
         )
-        yield StreamDoneEvent(
-            result=PipelineResult(
-                answer=" ".join(accepted_sentences),
-                query_text=query_text,
-                sources=retrieval_result.chunks,
-                scores=retrieval_result.scores,
-                latency_trace=latency_trace,
-                guard_flags=guard_flags,
-                degraded=False,
-                errors=errors,
-            )
+        final_result = PipelineResult(
+            answer=" ".join(accepted_sentences),
+            query_text=query_text,
+            sources=retrieval_result.chunks,
+            scores=retrieval_result.scores,
+            trace=trace,
+            guard_flags=guard_flags,
+            degraded=False,
+            errors=errors,
         )
+        self._cache_result(cache_key, final_result)
+        log(final_result)
+        yield StreamDoneEvent(result=final_result)
+
+
+DEFAULT_K_VALUES = (1, 3, 5, 10)
 
 
 def load_benchmark(benchmark_path: str) -> list[dict[str, Any]]:
     """
-    Load a benchmark dataset of (query, expected_answer, expected_sources) records.
+    Load a benchmark dataset of labeled retrieval cases.
+
+    Each case is a dict as produced by QueryDoc.to_eval_cases (see
+    src/data_loader.py): {"query_id", "query", "language", "query_type",
+    "expected_answer", "relevant_passage_ids"}, where relevant_passage_ids
+    comes from MSMARCO-XI's own is_selected labels.
 
     Args:
         benchmark_path: filesystem path to the benchmark JSON file.
@@ -608,28 +970,221 @@ def load_benchmark(benchmark_path: str) -> list[dict[str, Any]]:
     Returns:
         list[dict]: benchmark case records.
     """
-    raise NotImplementedError
+    with open(benchmark_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def run_benchmark(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def _ranked_passages(chunks: list[Chunk]) -> list[tuple[Any, Any]]:
     """
-    Run the pipeline over each benchmark case and compute aggregate metrics.
+    Reduce a ranked chunk list to a ranked list of distinct passage keys.
+
+    Ranking is scored over passages, not chunks. The corpus indexes each
+    passage once per language (e.g. Hindi and English), so the same
+    (query_id, passage_id) legitimately appears twice in one result; counting
+    both would inflate recall and let a single passage retrieved in two
+    languages masquerade as two distinct hits. The highest-ranked occurrence
+    of each passage is kept.
+
+    Args:
+        chunks: retrieved chunks, best first.
+
+    Returns:
+        list[tuple]: (query_id, passage_id) keys, best first, deduped.
+    """
+    seen: set[tuple[Any, Any]] = set()
+    ranked = []
+    for chunk in chunks:
+        key = (chunk.metadata.get("query_id"), chunk.metadata.get("passage_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append(key)
+    return ranked
+
+
+def run_benchmark(
+    cases: list[dict[str, Any]],
+    retriever: Retriever,
+    k_values: tuple[int, ...] = DEFAULT_K_VALUES,
+) -> dict[str, Any]:
+    """
+    Run each benchmark case through retrieval and compute aggregate metrics.
+
+    Deliberately scoped to retrieval, not the full pipeline: hit rate,
+    recall, precision, and MRR are all computable from is_selected labels
+    alone, so this runs with no API keys, no STT, and no LLM spend, and its
+    numbers are deterministic. End-to-end answer quality and latency are
+    measured separately by benchmarks/run_benchmark.py.
+
+    Note this takes an explicit `retriever` rather than building one: metrics
+    are only meaningful against the same corpus the cases were generated
+    from, so the caller owns constructing and indexing that store. The
+    retriever's top_n must be at least max(k_values) for the larger k's to
+    mean anything.
 
     Args:
         cases: benchmark case records as returned by load_benchmark.
+        retriever: a Retriever over an already-indexed VectorStore.
+        k_values: cutoffs to report metrics at.
 
     Returns:
-        dict: aggregate metrics (e.g. accuracy, groundedness rate, avg latency)
-        plus per-case results.
+        dict: aggregate metrics overall and per language, plus per-case rows.
     """
-    raise NotImplementedError
+    max_k = max(k_values)
+    if retriever.top_n < max_k:
+        logger.warning(
+            "retriever.top_n=%d is below max(k_values)=%d; metrics at k>%d are truncated "
+            "and will understate retrieval quality",
+            retriever.top_n,
+            max_k,
+            retriever.top_n,
+        )
+
+    rows = []
+    for case in cases:
+        result = retriever.retrieve(case["query"])
+        ranked = _ranked_passages(result.chunks)
+        relevant = {(case["query_id"], pid) for pid in case["relevant_passage_ids"]}
+
+        first_rank = next(
+            (rank for rank, key in enumerate(ranked, start=1) if key in relevant), None
+        )
+        per_k = {}
+        for k in k_values:
+            found = sum(1 for key in ranked[:k] if key in relevant)
+            per_k[k] = {
+                "hit": found > 0,
+                "recall": found / len(relevant),
+                "precision": found / k,
+            }
+
+        rows.append(
+            {
+                "query_id": case["query_id"],
+                "language": case["language"],
+                "query": case["query"],
+                "first_relevant_rank": first_rank,
+                "reciprocal_rank": 1.0 / first_rank if first_rank else 0.0,
+                "low_confidence": result.low_confidence,
+                # True when retrieval returned fewer distinct passages than the
+                # largest cutoff, so metrics at that k are bounded by how much
+                # the retriever returned rather than by its ranking quality.
+                # Tracked because top_n counts chunks while ranking counts
+                # passages — with each passage indexed per language, a top_n
+                # comfortably above max_k can still yield too few passages.
+                "truncated": len(ranked) < max_k,
+                "per_k": per_k,
+            }
+        )
+
+    def aggregate(subset: list[dict[str, Any]]) -> dict[str, Any]:
+        if not subset:
+            return {}
+        n = len(subset)
+        return {
+            "n": n,
+            "mrr": sum(r["reciprocal_rank"] for r in subset) / n,
+            "low_confidence_rate": sum(1 for r in subset if r["low_confidence"]) / n,
+            "truncated_rate": sum(1 for r in subset if r["truncated"]) / n,
+            **{
+                f"hit_rate@{k}": sum(1 for r in subset if r["per_k"][k]["hit"]) / n
+                for k in k_values
+            },
+            **{f"recall@{k}": sum(r["per_k"][k]["recall"] for r in subset) / n for k in k_values},
+            **{
+                f"precision@{k}": sum(r["per_k"][k]["precision"] for r in subset) / n
+                for k in k_values
+            },
+        }
+
+    languages = sorted({row["language"] for row in rows})
+    return {
+        "k_values": list(k_values),
+        "overall": aggregate(rows),
+        "per_language": {
+            lang: aggregate([r for r in rows if r["language"] == lang]) for lang in languages
+        },
+        "cases": rows,
+    }
 
 
-def report_results(results: dict[str, Any]) -> None:
+def report_results(results: dict[str, Any], report_path: str | Path | None = None) -> str:
     """
-    Print/write a human-readable summary of benchmark results.
+    Render a human-readable Markdown summary of benchmark results.
 
     Args:
         results: results dict as returned by run_benchmark.
+        report_path: if given, the report is also written to this path.
+
+    Returns:
+        str: the rendered Markdown report.
     """
-    raise NotImplementedError
+    k_values = results["k_values"]
+    overall = results["overall"]
+
+    lines = [
+        "# Retrieval evaluation — ai4bharat/MSMARCO-XI",
+        "",
+        "Retrieval-only metrics scored against the dataset's own `is_selected` relevance",
+        "labels. A passage counts as retrieved once, regardless of how many languages it",
+        "was indexed in. No LLM is involved, so these numbers are deterministic.",
+        "",
+        f"Cases: **{overall.get('n', 0)}** | MRR: **{overall.get('mrr', 0):.3f}** | "
+        f"low-confidence rate: **{overall.get('low_confidence_rate', 0):.1%}**",
+        "",
+        f"Coverage: {overall.get('truncated_rate', 0):.1%} of cases returned fewer than "
+        f"{max(k_values)} distinct passages, so their metrics at the largest k are bounded by "
+        "retrieval depth rather than ranking quality.",
+        "",
+        "## Overall",
+        "",
+        "| k | hit rate@k | recall@k | precision@k |",
+        "| --- | --- | --- | --- |",
+    ]
+    for k in k_values:
+        lines.append(
+            f"| {k} | {overall.get(f'hit_rate@{k}', 0):.1%} | "
+            f"{overall.get(f'recall@{k}', 0):.1%} | {overall.get(f'precision@{k}', 0):.1%} |"
+        )
+
+    leaked = results.get("leaked_comparison")
+    if leaked:
+        lines += [
+            "",
+            "## Label-leak control",
+            "",
+            "The same eval re-run with `Retriever(is_selected_boost=0.1)` — the production",
+            "default. `is_selected` is the relevance label being scored, so boosting by it",
+            "hands the ranker the answer. The gap below is the size of that leak, and is the",
+            "reason the headline numbers above disable the boost.",
+            "",
+            "| metric | honest | with is_selected boost |",
+            "| --- | --- | --- |",
+            f"| MRR | {overall.get('mrr', 0):.3f} | {leaked.get('mrr', 0):.3f} |",
+        ]
+        for k in k_values:
+            key = f"hit_rate@{k}"
+            lines.append(
+                f"| hit rate@{k} | {overall.get(key, 0):.1%} | {leaked.get(key, 0):.1%} |"
+            )
+
+    per_language = results.get("per_language") or {}
+    if len(per_language) > 1:
+        lines += [
+            "",
+            "## By query language",
+            "",
+            "| language | n | MRR | " + " | ".join(f"hit@{k}" for k in k_values) + " |",
+            "| --- | --- | --- | " + " | ".join("---" for _ in k_values) + " |",
+        ]
+        for lang, metrics in per_language.items():
+            hits = " | ".join(f"{metrics.get(f'hit_rate@{k}', 0):.1%}" for k in k_values)
+            lines.append(
+                f"| {lang} | {metrics.get('n', 0)} | {metrics.get('mrr', 0):.3f} | {hits} |"
+            )
+
+    report = "\n".join(lines) + "\n"
+    if report_path is not None:
+        Path(report_path).write_text(report, encoding="utf-8")
+    print(report)
+    return report

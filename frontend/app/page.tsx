@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { LatencyTrace, PipelineResult } from "./types";
+import type { PipelineResult, RequestTrace } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -28,13 +28,38 @@ function parseSseFrame(frame: string): { event: string; data: string } | null {
   return data ? { event: eventType, data } : null;
 }
 
-function getStageDuration(trace: LatencyTrace, stage: string): number | null {
-  const match = trace.stages.find((s) => s.stage === stage);
-  return match ? match.duration_ms : null;
+/**
+ * Total duration of the named spans, or null if none of them ran.
+ *
+ * null and 0 are deliberately different: "this stage never ran" (a cache hit
+ * skips retrieval entirely) renders as "—", while "ran and cost nothing
+ * measurable" renders as "0 ms".
+ *
+ * Defensive about the shape on purpose. This component is rendered from a
+ * payload owned by a separate backend, and a renamed field previously took the
+ * whole page down with an uncaught TypeError rather than degrading one table
+ * cell. A missing span list should cost a dash, not the app.
+ */
+function spanTotal(trace: RequestTrace | undefined, ...names: string[]): number | null {
+  const spans = trace?.spans;
+  if (!Array.isArray(spans)) return null;
+  const matched = spans.filter((s) => names.includes(s.name));
+  return matched.length ? matched.reduce((sum, s) => sum + s.duration_ms, 0) : null;
 }
 
-function getTotalDuration(trace: LatencyTrace): number {
-  return trace.stages.reduce((sum, s) => sum + s.duration_ms, 0);
+/** A value from the trace's overlapping aggregates (e.g. `llm_ttft`). */
+function detail(trace: RequestTrace | undefined, name: string): number | null {
+  const value = trace?.details?.[name];
+  return typeof value === "number" ? value : null;
+}
+
+/**
+ * The measured wall clock, taken from the server rather than summed here — see
+ * RequestTrace in ./types. Summing spans would quietly drop whatever the
+ * backend didn't instrument.
+ */
+function totalMs(trace: RequestTrace | undefined): number | null {
+  return typeof trace?.total_ms === "number" ? trace.total_ms : null;
 }
 
 function formatMs(ms: number | null): string {
@@ -273,6 +298,7 @@ export default function Home() {
             <h2>
               Answer
               {result.degraded && <span className="badge">degraded</span>}
+              {result.cached && <span className="badge cached">cached</span>}
             </h2>
             <p className="answerText">{result.answer}</p>
           </div>
@@ -301,20 +327,57 @@ export default function Home() {
               </thead>
               <tbody>
                 <tr>
-                  <td>STT</td>
-                  <td>{formatMs(getStageDuration(result.latency_trace, "stt"))}</td>
+                  <td>Speech-to-text</td>
+                  <td>{formatMs(spanTotal(result.trace, "stt_network"))}</td>
+                </tr>
+                <tr>
+                  <td>Embedding</td>
+                  <td>{formatMs(spanTotal(result.trace, "embedding_cache", "embedding_compute"))}</td>
                 </tr>
                 <tr>
                   <td>Retrieval</td>
-                  <td>{formatMs(getStageDuration(result.latency_trace, "retrieval"))}</td>
+                  <td>{formatMs(spanTotal(result.trace, "vector_search", "reranking", "retrieval_overhead"))}</td>
                 </tr>
                 <tr>
-                  <td>Generation</td>
-                  <td>{formatMs(getStageDuration(result.latency_trace, "generation"))}</td>
+                  <td>Guardrails</td>
+                  <td>
+                    {formatMs(spanTotal(result.trace, "query_preprocessing", "relevance_guard", "grounding_guard"))}
+                  </td>
                 </tr>
                 <tr>
+                  <td>
+                    LLM<span className="stageNote">first token at {formatMs(detail(result.trace, "llm_ttft"))}</span>
+                  </td>
+                  <td>
+                    {formatMs(
+                      spanTotal(result.trace, "llm_network", "llm_client_wait", "llm_generation", "llm_retry_wait"),
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <td>
+                    Server overhead
+                    <span className="stageNote">middleware, body parse, serialization, flush</span>
+                  </td>
+                  <td>
+                    {formatMs(
+                      spanTotal(result.trace, "middleware", "body_parse", "serialization", "response_write"),
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <td>
+                    Unaccounted<span className="stageNote">wall clock no stage claimed</span>
+                  </td>
+                  <td>
+                    {formatMs(
+                      typeof result.trace?.unaccounted_ms === "number" ? result.trace.unaccounted_ms : null,
+                    )}
+                  </td>
+                </tr>
+                <tr className="latencyTotalRow">
                   <td>Total</td>
-                  <td>{formatMs(getTotalDuration(result.latency_trace))}</td>
+                  <td>{formatMs(totalMs(result.trace))}</td>
                 </tr>
               </tbody>
             </table>

@@ -306,6 +306,28 @@ table.latencyTable {
 }
 
 .latencyTable tr:last-child td {
-  font-weight: 700;
   border-bottom: none;
+}
+
+/* The measured wall clock, called out as the row every other row rolls up into. */
+.latencyTotalRow td {
+  font-weight: 700;
+  border-top: 1px solid var(--border);
+}
+
+/* Secondary label under a stage name: what the row covers, or a sub-measurement
+   (LLM time-to-first-token) that overlaps the row rather than adding to it. */
+.stageNote {
+  display: block;
+  font-size: 0.7rem;
+  font-weight: 400;
+  color: var(--muted);
+  margin-top: 0.1rem;
+}
+
+/* Cache-hit marker. Shares .badge's shape but reads as good news, not a fault
+   like the degraded badge. */
+.badge.cached {
+  background: color-mix(in srgb, var(--success) 15%, transparent);
+  color: var(--success);
 }
