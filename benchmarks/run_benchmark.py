@@ -20,6 +20,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(ROOT / ".env")
+
 from src import generation  # noqa: E402
 from src.chunking import ChunkerRegistry  # noqa: E402
 from src.generation import Generator, LLMProvider  # noqa: E402

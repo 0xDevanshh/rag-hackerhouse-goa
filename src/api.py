@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -17,7 +18,10 @@ from src.chunking import ChunkerRegistry
 from src.harness import PipelineHarness, PipelineResult
 from src.vectorstore import VectorStore
 
-DEFAULT_CORPUS_PATH = Path(__file__).resolve().parent.parent / "data" / "sample_corpus.json"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT_DIR / ".env")
+
+DEFAULT_CORPUS_PATH = ROOT_DIR / "data" / "sample_corpus.json"
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
 
 app = FastAPI(title="voice-rag API")
