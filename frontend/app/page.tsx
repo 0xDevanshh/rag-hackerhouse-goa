@@ -62,6 +62,27 @@ function totalMs(trace: RequestTrace | undefined): number | null {
   return typeof trace?.total_ms === "number" ? trace.total_ms : null;
 }
 
+function ragTotalMs(trace: RequestTrace | undefined): number | null {
+  return spanTotal(
+    trace,
+    "query_preprocessing",
+    "embedding_cache",
+    "embedding_compute",
+    "vector_search",
+    "bm25",
+    "fusion",
+    "reranking",
+    "retrieval_overhead",
+    "relevance_guard",
+    "context_build",
+    "llm_network",
+    "llm_client_wait",
+    "llm_generation",
+    "llm_retry_wait",
+    "grounding_guard",
+  );
+}
+
 function formatMs(ms: number | null): string {
   return ms === null ? "—" : `${ms.toFixed(0)} ms`;
 }
@@ -336,7 +357,15 @@ export default function Home() {
                 </tr>
                 <tr>
                   <td>Retrieval</td>
-                  <td>{formatMs(spanTotal(result.trace, "vector_search", "reranking", "retrieval_overhead"))}</td>
+                  <td>{formatMs(spanTotal(result.trace, "vector_search", "bm25", "fusion", "reranking", "retrieval_overhead"))}</td>
+                </tr>
+                <tr>
+                  <td>BM25 lexical search</td>
+                  <td>{formatMs(spanTotal(result.trace, "bm25"))}</td>
+                </tr>
+                <tr>
+                  <td>RRF fusion</td>
+                  <td>{formatMs(spanTotal(result.trace, "fusion"))}</td>
                 </tr>
                 <tr>
                   <td>Guardrails</td>
@@ -376,7 +405,11 @@ export default function Home() {
                   </td>
                 </tr>
                 <tr className="latencyTotalRow">
-                  <td>Total</td>
+                  <td>RAG total</td>
+                  <td>{formatMs(ragTotalMs(result.trace))}</td>
+                </tr>
+                <tr className="latencyTotalRow">
+                  <td>Full voice total</td>
                   <td>{formatMs(totalMs(result.trace))}</td>
                 </tr>
               </tbody>

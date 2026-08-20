@@ -25,7 +25,7 @@ that separates what we control (in-process compute) from what we don't (third-pa
         │                                                  │
         │  1. STT                (Sarvam / MockSTT)  ──────┼──▶ network-bound
         │  2. InputGuardrail                              │
-        │  3. Retrieval           (FAISS + Embedder)       │
+        │  3. Retrieval           (FAISS + BM25 + RRF)    │
         │  4. RelevanceGuardrail                           │
         │  5. Generator          (Groq / Anthropic)  ──────┼──▶ network-bound
         │  6. GroundingGuardrail                           │
@@ -37,7 +37,7 @@ that separates what we control (in-process compute) from what we don't (third-pa
                 scores, latency_trace, guard_flags, degraded }
 
   Offline indexing (once, at startup):
-  ai4bharat/MSMARCO-XI → data_loader.py → MetadataAwareChunker → Embedder → FAISS IndexFlatIP
+  ai4bharat/MSMARCO-XI → data_loader.py → MetadataAwareChunker → Embedder + BM25 → FAISS/RRF
    (hi + en passages)    (src/data_loader.py)  (src/chunking.py)        (src/vectorstore.py)
      └─ falls back to data/sample_corpus.json + RecursiveChunker if the dataset can't be loaded
 ```
@@ -138,6 +138,14 @@ language in the *parquet filename* (`validation/hinval.parquet`) with a 3-letter
 validation parquet but no train parquet, and `datasets` ≥ 4 ignores the repo's `ms_marco_translations.py`
 loading script entirely.
 
+## Retrieval (`src/retrieval.py`)
+
+Each request uses the locally warmed multilingual embedding model for dense FAISS search and an
+in-process BM25 index built once during startup. The two ranked candidate lists are combined with
+configurable reciprocal-rank fusion (`RRF_K`, default 60), then lightly reranked with language and
+metadata signals. BM25 construction is never performed in a request handler. Retrieval traces expose
+`vector_search`, `bm25`, `fusion`, and `reranking` separately, so the RAG SLA cannot hide lexical work.
+
 ## Retrieval evaluation (`benchmarks/run_eval.py`)
 
 `is_selected` doubles as retrieval ground truth, so retrieval accuracy is measurable without an LLM:
@@ -226,6 +234,7 @@ fabricated `0.0` for stages that don't exist would be worse than their absence.
 ```bash
 venv/bin/python benchmarks/run_latency_trace.py            # text path: 1 cold, 20 warm, 20 cached
 venv/bin/python benchmarks/run_latency_trace.py --voice    # audio path (measures the STT round trip)
+venv/bin/python benchmarks/run_concurrency.py               # text route at concurrency 1/5/10/25
 ```
 
 Writes [`benchmarks/latency_trace_text.md`](benchmarks/latency_trace_text.md) and
@@ -284,6 +293,8 @@ regenerated on each run: [`benchmarks/latency_report.md`](benchmarks/latency_rep
 
 ```bash
 venv/bin/python benchmarks/run_benchmark.py
+# Quick labeled evaluation using 100 source rows (the minimum requested size)
+EVAL_LIMIT=100 venv/bin/python benchmarks/run_eval.py
 ```
 
 ## API reference
@@ -292,10 +303,11 @@ venv/bin/python benchmarks/run_benchmark.py
 |---|---|
 | `GET /health` | `{"status": "ok"}` — frontend checks this before allowing recording |
 | `POST /query` | multipart field `audio` → runs `PipelineHarness.run`, returns `PipelineResult` JSON |
-| `POST /query/text` | `{"query": "..."}` → same pipeline, skipping STT. The only path that can meet a sub-200ms budget |
+| `POST /query/text` | `{"query": "..."}` → same pipeline, skipping STT. The RAG SLA path |
 | `POST /query/stream` | multipart field `audio` → Server-Sent Events, one grounding-checked sentence at a time |
 | `GET /metrics/cache` | embedding- and answer-cache hit/miss counters |
 | `GET /metrics/traces` | recent completed request traces (needs `TRACE_BUFFER_SIZE`) |
+| `GET /ready` | readiness check for the indexed corpus and initialized LLM provider |
 
 ```bash
 curl -X POST http://localhost:8000/query -F "audio=@question.wav"
