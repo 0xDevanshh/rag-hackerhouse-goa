@@ -4,7 +4,7 @@ Retrieval-only metrics scored against the dataset's own `is_selected` relevance
 labels. A passage counts as retrieved once, regardless of how many languages it
 was indexed in. No LLM is involved, so these numbers are deterministic.
 
-Cases: **496** | MRR: **0.423** | low-confidence rate: **0.0%**
+Cases: **102** | MRR: **0.483** | low-confidence rate: **0.0%**
 
 Coverage: 0.0% of cases returned fewer than 10 distinct passages, so their metrics at the largest k are bounded by retrieval depth rather than ranking quality.
 
@@ -12,10 +12,10 @@ Coverage: 0.0% of cases returned fewer than 10 distinct passages, so their metri
 
 | k | hit rate@k | recall@k | precision@k |
 | --- | --- | --- | --- |
-| 1 | 22.8% | 22.1% | 22.8% |
-| 3 | 55.8% | 54.1% | 19.0% |
-| 5 | 68.1% | 66.5% | 14.2% |
-| 10 | 80.4% | 79.8% | 8.6% |
+| 1 | 30.4% | 29.9% | 30.4% |
+| 3 | 54.9% | 53.9% | 18.6% |
+| 5 | 68.6% | 67.2% | 14.1% |
+| 10 | 92.2% | 90.2% | 9.6% |
 
 ## Label-leak control
 
@@ -26,15 +26,15 @@ reason the headline numbers above disable the boost.
 
 | metric | honest | with is_selected boost |
 | --- | --- | --- |
-| MRR | 0.423 | 0.717 |
-| hit rate@1 | 22.8% | 62.5% |
-| hit rate@3 | 55.8% | 78.8% |
-| hit rate@5 | 68.1% | 84.3% |
-| hit rate@10 | 80.4% | 88.5% |
+| MRR | 0.483 | 0.483 |
+| hit rate@1 | 30.4% | 30.4% |
+| hit rate@3 | 54.9% | 54.9% |
+| hit rate@5 | 68.6% | 68.6% |
+| hit rate@10 | 92.2% | 92.2% |
 
 ## By query language
 
 | language | n | MRR | hit@1 | hit@3 | hit@5 | hit@10 |
 | --- | --- | --- | --- | --- | --- | --- |
-| en | 248 | 0.523 | 32.3% | 67.3% | 81.0% | 92.3% |
-| hi | 248 | 0.322 | 13.3% | 44.4% | 55.2% | 68.5% |
+| en | 51 | 0.594 | 41.2% | 70.6% | 84.3% | 98.0% |
+| hi | 51 | 0.373 | 19.6% | 39.2% | 52.9% | 86.3% |

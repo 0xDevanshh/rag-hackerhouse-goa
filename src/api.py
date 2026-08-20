@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -26,7 +27,7 @@ if __name__ == "__main__" and str(ROOT_DIR) not in sys.path:
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from src import data_loader
@@ -248,6 +249,7 @@ class LatencyTraceMiddleware:
 
         trace = RequestTrace()
         trace.start()
+        trace.label("request_id", uuid.uuid4().hex)
         trace.mark("arrival")
         # Starlette exposes scope["state"] as request.state, which is how the
         # route handler below gets hold of this trace.
@@ -326,6 +328,25 @@ def _request_trace(request: Request) -> RequestTrace:
 def health() -> dict:
     """Liveness check for the frontend to confirm the backend is reachable."""
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready() -> dict:
+    """Report whether the indexed corpus and generation provider are usable."""
+    if _harness is None:
+        return JSONResponse(status_code=503, content={"ready": False, "reason": "pipeline_not_initialized"})
+    if _harness.store.index is None or _harness.store.index.ntotal == 0:
+        return JSONResponse(status_code=503, content={"ready": False, "reason": "index_unavailable"})
+    provider = getattr(_harness.generator, "provider", None)
+    provider_ready = provider is not None
+    if not provider_ready:
+        return JSONResponse(status_code=503, content={"ready": False, "reason": "llm_unavailable"})
+    return {
+        "ready": True,
+        "index_chunks": int(_harness.store.index.ntotal),
+        "embedding_model": _harness.store.embedder.model_name,
+        "llm_provider": type(provider).__name__,
+    }
 
 
 @app.get("/metrics/cache")

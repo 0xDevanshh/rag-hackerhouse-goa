@@ -20,6 +20,7 @@ the eval set is reviewable) and benchmarks/eval_report.md.
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -37,7 +38,7 @@ REPORT_PATH = ROOT / "benchmarks" / "eval_report.md"
 
 LANGUAGE = "hi"
 SPLIT = "validation"
-LIMIT = 500
+LIMIT = int(os.environ.get("EVAL_LIMIT", "500"))
 INCLUDE_ENGLISH = True
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)

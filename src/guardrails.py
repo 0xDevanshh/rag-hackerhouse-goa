@@ -218,6 +218,15 @@ class GroundingGuardrail:
         if not retrieved_chunks:
             return GuardResult(allowed=False, reason="no_context_to_ground_against", response_override=REFUSAL_RESPONSE)
 
+        # The local extractive provider returns a literal prefix of the top
+        # passage followed by its citation. Exact evidence needs no second
+        # embedding pass; preserving this check keeps the fast path grounded.
+        citation_match = re.search(r"\s*\[passage_id:\s*[^\]]+\]\s*$", answer_text)
+        if citation_match:
+            evidence = answer_text[: citation_match.start()].strip()
+            if evidence and any(evidence in chunk.text for chunk in retrieved_chunks):
+                return GuardResult(allowed=True, reason="exact_retrieved_evidence")
+
         chunk_vectors = self._chunk_vectors(retrieved_chunks, chunk_embeddings, timing)
         sentence_embeddings = self.embedder.encode(sentences, timing=timing)
 

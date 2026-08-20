@@ -8,6 +8,9 @@ back to a rewritten query once when confidence is low.
 
 import re
 import time
+import math
+import unicodedata
+from collections import Counter, defaultdict
 
 from pydantic import BaseModel
 
@@ -21,9 +24,10 @@ from src.vectorstore import VectorStore
 # and a smaller FAISS fetch, at negligible recall risk for this scoring model.
 RERANK_POOL_SIZE = 10
 TOP_N = 5
-IS_SELECTED_BOOST = 0.1
+IS_SELECTED_BOOST = 0.0
 LANGUAGE_MATCH_BOOST = 0.05
 LOW_CONFIDENCE_THRESHOLD = 0.3
+RRF_K = 60
 
 # Unicode script ranges used for heuristic query-language detection.
 _SCRIPT_LANGUAGE_RANGES = {
@@ -40,6 +44,78 @@ _STOPWORDS = {
 }
 
 _PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def normalize_query(text: str) -> str:
+    """Canonicalize query text consistently for routing, lexical search, and caches."""
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+
+
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"\w+", normalize_query(text), flags=re.UNICODE)
+
+
+class QueryRouter:
+    """Millisecond-scale heuristic query classification; no model call required."""
+
+    _question_words = {"what", "who", "when", "where", "which", "is", "are", "how", "why"}
+
+    def classify(self, query: str) -> str:
+        lowered = normalize_query(query)
+        if not lowered:
+            return "AMBIGUOUS"
+        if any(lowered.startswith(prefix) for prefix in ("find ", "search ", "list documents")):
+            return "KEYWORD"
+        tokens = set(_tokens(lowered))
+        if "why" in tokens or "how" in tokens:
+            return "CONTEXTUAL"
+        if tokens & self._question_words:
+            return "FACTUAL"
+        return "AMBIGUOUS"
+
+
+class BM25Index:
+    """Small in-process BM25 index for the already-loaded chunk set."""
+
+    def __init__(self, chunks: list[Chunk], k1: float = 1.2, b: float = 0.75):
+        self.chunks = chunks
+        self.k1 = k1
+        self.b = b
+        self.term_frequencies = [Counter(_tokens(chunk.text)) for chunk in chunks]
+        self.document_frequency: Counter[str] = Counter()
+        self.postings: dict[str, list[int]] = defaultdict(list)
+        for position, frequencies in enumerate(self.term_frequencies):
+            self.document_frequency.update(frequencies.keys())
+            for term in frequencies:
+                self.postings[term].append(position)
+        self.average_length = sum(sum(freq.values()) for freq in self.term_frequencies) / max(len(chunks), 1)
+
+    def search(self, query: str, top_k: int) -> list[tuple[Chunk, float, int]]:
+        query_terms = _tokens(query)
+        if not query_terms:
+            return []
+        document_count = len(self.chunks)
+        candidate_positions: set[int] = set()
+        for term in set(query_terms):
+            candidate_positions.update(self.postings.get(term, ()))
+
+        scored: list[tuple[float, int]] = []
+        for position in candidate_positions:
+            frequencies = self.term_frequencies[position]
+            length = sum(frequencies.values()) or 1
+            score = 0.0
+            for term in query_terms:
+                frequency = frequencies.get(term, 0)
+                if not frequency:
+                    continue
+                idf = math.log(1 + (document_count - self.document_frequency[term] + 0.5) / (self.document_frequency[term] + 0.5))
+                score += idf * frequency * (self.k1 + 1) / (
+                    frequency + self.k1 * (1 - self.b + self.b * length / max(self.average_length, 1))
+                )
+            if score > 0:
+                scored.append((score, position))
+        scored.sort(reverse=True)
+        return [(self.chunks[position], score, position) for score, position in scored[:top_k]]
 
 
 class RetrievalResult(BaseModel):
@@ -105,6 +181,8 @@ class Retriever:
         low_confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD,
         is_selected_boost: float = IS_SELECTED_BOOST,
         language_match_boost: float = LANGUAGE_MATCH_BOOST,
+        rrf_k: int = RRF_K,
+        lexical_weight: float = 0.05,
     ):
         """
         Args:
@@ -129,11 +207,30 @@ class Retriever:
         self.low_confidence_threshold = low_confidence_threshold
         self.is_selected_boost = is_selected_boost
         self.language_match_boost = language_match_boost
+        self.rrf_k = rrf_k
+        self.lexical_weight = lexical_weight
+        self.router = QueryRouter()
+        self._bm25: BM25Index | None = None
+        self._indexed_chunk_count = 0
+
+    def _lexical_index(self) -> BM25Index:
+        """Build BM25 once per vector-store corpus, never inside each request."""
+        if self._bm25 is None or self._indexed_chunk_count != len(self.store.chunks):
+            self._bm25 = BM25Index(self.store.chunks)
+            self._indexed_chunk_count = len(self.store.chunks)
+        return self._bm25
+
+    def prepare_index(self) -> None:
+        """Build the lexical index during application startup/indexing."""
+        if self.store.chunks:
+            self._bm25 = BM25Index(self.store.chunks)
+            self._indexed_chunk_count = len(self.store.chunks)
 
     def _search_and_rerank(
         self, query: str, timing: dict[str, float] | None = None
     ) -> list[tuple[Chunk, float, int]]:
         query_language = _detect_language(query)
+        query_type = self.router.classify(query)
 
         # Embedder.encode writes embedding_cache_ms / embedding_compute_ms
         # into `timing` itself, so a cache hit and a real forward pass are
@@ -144,20 +241,45 @@ class Retriever:
         candidates = self.store.search(query_embedding, top_k=self.rerank_pool_size)
         t2 = time.perf_counter()
 
+        lexical_started = time.perf_counter()
+        lexical_candidates = self._lexical_index().search(query, self.rerank_pool_size)
+        lexical_ended = time.perf_counter()
+        lexical_scores = {position: score for _, score, position in lexical_candidates}
+        lexical_max = max(lexical_scores.values(), default=0.0)
+        dense_positions = {position for _, _, position in candidates}
+        fused_positions = set(dense_positions) | set(lexical_scores)
+        dense_rank = {position: rank for rank, (_, _, position) in enumerate(candidates, start=1)}
+        lexical_rank = {position: rank for rank, (_, _, position) in enumerate(lexical_candidates, start=1)}
+        fusion_scores = {
+            position: 1 / (self.rrf_k + dense_rank.get(position, self.rrf_k))
+            + 1 / (self.rrf_k + lexical_rank.get(position, self.rrf_k))
+            for position in fused_positions
+        }
+        by_position = {position: (chunk, score) for chunk, score, position in candidates}
+        by_position.update({position: (chunk, 0.0) for chunk, _, position in lexical_candidates if position not in by_position})
+        candidates = [
+            (by_position[position][0], by_position[position][1], position)
+            for position in sorted(fused_positions, key=lambda item: fusion_scores[item], reverse=True)
+        ][: self.rerank_pool_size]
+        fusion_ended = time.perf_counter()
+
         reranked = []
         for chunk, cosine_score, position in candidates:
-            score = cosine_score
+            lexical_score = lexical_scores.get(position, 0.0) / lexical_max if lexical_max else 0.0
+            score = cosine_score + self.lexical_weight * lexical_score
             if chunk.metadata.get("is_selected"):
                 score += self.is_selected_boost
             if chunk.metadata.get("language") == query_language:
                 score += self.language_match_boost
             reranked.append((chunk, score, position))
         reranked.sort(key=lambda triple: triple[1], reverse=True)
-        t3 = time.perf_counter()
+        rerank_ended = time.perf_counter()
 
         if timing is not None:
             timing["vector_search_ms"] = timing.get("vector_search_ms", 0.0) + (t2 - t1) * 1000
-            timing["reranking_ms"] = timing.get("reranking_ms", 0.0) + (t3 - t2) * 1000
+            timing["bm25_ms"] = timing.get("bm25_ms", 0.0) + (lexical_ended - lexical_started) * 1000
+            timing["fusion_ms"] = timing.get("fusion_ms", 0.0) + (fusion_ended - lexical_ended) * 1000
+            timing["reranking_ms"] = timing.get("reranking_ms", 0.0) + (rerank_ended - fusion_ended) * 1000
             timing["search_passes"] = timing.get("search_passes", 0) + 1
 
         return reranked

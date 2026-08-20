@@ -48,7 +48,14 @@ PROMPT_VERSION = "1"
 
 # Retrieval sub-timings that Retriever.retrieve reports and that the trace
 # records as flat, non-overlapping spans.
-_RETRIEVAL_SPANS = ("embedding_cache", "embedding_compute", "vector_search", "reranking")
+_RETRIEVAL_SPANS = (
+    "embedding_cache",
+    "embedding_compute",
+    "vector_search",
+    "bm25",
+    "fusion",
+    "reranking",
+)
 
 
 # Note on normalization: the answer cache keys off text_fingerprint(), which
@@ -258,7 +265,13 @@ class PipelineHarness:
         if guard_embedder is not None and guard_embedder is not self.store.embedder:
             timings["grounding_embedder_warmup_ms"] = await asyncio.to_thread(guard_embedder.warmup)
         try:
-            timings["llm_prewarm_ms"] = await self.generator.prewarm()
+            # Provider SDKs can wait indefinitely during DNS or connection
+            # setup. Prewarming is an optimization, so it must never prevent
+            # the health endpoint and API from starting.
+            prewarm_timeout = float(os.environ.get("LLM_PREWARM_TIMEOUT_SECONDS", "5"))
+            timings["llm_prewarm_ms"] = await asyncio.wait_for(
+                self.generator.prewarm(), timeout=prewarm_timeout
+            )
         except Exception as exc:
             logger.warning("LLM prewarm skipped (%s)", exc)
         if self.stt_client is not None:
@@ -361,6 +374,7 @@ class PipelineHarness:
                     if not self.chunks:
                         raise RuntimeError("VectorStore is empty and no chunks were provided to index")
                     await asyncio.to_thread(self.store.build, self.chunks)
+                    await asyncio.to_thread(self.retriever.prepare_index)
                     self._index_version += 1
 
             started = time.perf_counter()

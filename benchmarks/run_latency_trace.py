@@ -19,7 +19,7 @@ together:
   warm     N distinct queries against a warmed process. The uncached RAG path.
   cached   N repeats of an already-answered query. The fast path.
 
-Reports p50/p95/p99 per phase, and checks the trace's own honesty invariant:
+Reports p50/p70/p95/p99/p100 per phase, and checks the trace's own honesty invariant:
 sum(spans) + unaccounted_ms == total_ms.
 
 Usage:
@@ -67,7 +67,13 @@ def report_path(voice: bool) -> Path:
 # make the before/after comparison against the original trace impossible.
 METRIC_SPANS: dict[str, tuple[str, ...]] = {
     "embedding_ms": ("embedding_cache_ms", "embedding_compute_ms"),
-    "retrieval_ms": ("vector_search_ms", "reranking_ms", "retrieval_overhead_ms"),
+    "retrieval_ms": (
+        "vector_search_ms",
+        "bm25_ms",
+        "fusion_ms",
+        "reranking_ms",
+        "retrieval_overhead_ms",
+    ),
     "llm_ttft_ms": ("llm_ttft_ms",),
     "llm_total_ms": ("llm_total_ms",),
     "total_ms": ("total_ms",),
@@ -83,6 +89,8 @@ ALL_SPANS = (
     "embedding_cache_ms",
     "embedding_compute_ms",
     "vector_search_ms",
+    "bm25_ms",
+    "fusion_ms",
     "reranking_ms",
     "retrieval_overhead_ms",
     "relevance_guard_ms",
@@ -182,7 +190,17 @@ async def _drive(app, requests_, voice: bool, delay: float = 0.0):
             client_ms = (time.perf_counter() - started) * 1000
 
             traces = list(api_module._recent_traces)[before:]
-            body = response.json() if response.status_code == 200 else {}
+            try:
+                response_body = response.json()
+            except ValueError:
+                response_body = {}
+            if response.status_code != 200:
+                detail = response_body.get("detail", response.text[:300]) if isinstance(response_body, dict) else response.text[:300]
+                raise RuntimeError(
+                    f"voice latency request {n + 1} failed with HTTP {response.status_code}: {detail}. "
+                    "No latency report was written; configure the required STT/LLM credentials and retry."
+                )
+            body = response_body
             rows.append(
                 {
                     "status": response.status_code,
@@ -350,6 +368,20 @@ def _metric_table(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _assignment_metric_table(rows: list[dict]) -> list[str]:
+    """Report the P50/P70/P100 metrics required by the submission brief."""
+    lines = ["| metric | P50 (ms) | P70 (ms) | P100 (ms) | n |", "| --- | --- | --- | --- | --- |"]
+    for metric in METRIC_SPANS:
+        pct = percentiles(_metric_values(rows, metric), quantiles=(50, 70, 100))
+        if pct is None:
+            lines.append(f"| `{metric}` | n/a | n/a | n/a | 0 |")
+        else:
+            lines.append(
+                f"| `{metric}` | {pct['p50']:.1f} | {pct['p70']:.1f} | {pct['p100']:.1f} | {pct['n']} |"
+            )
+    return lines
+
+
 def _stage_table(rows: list[dict]) -> list[str]:
     lines = ["| span | p50 (ms) | p95 (ms) | p99 (ms) | n |", "| --- | --- | --- | --- | --- |"]
     for span in ALL_SPANS:
@@ -464,6 +496,13 @@ def write_report(cold: dict, warm_cached: dict, voice: bool, reps: int, delay: f
         "### Required metrics",
         "",
     ]
+    lines += _assignment_metric_table(warm_rows)
+    lines += [
+        "",
+        "The table above is the submission metric: the warm uncached `total_ms` row is the full request path, "
+        "including voice transcription when `--voice` is used. The P95/P99 diagnostics below show tail shape.",
+        "",
+    ]
     lines += _metric_table(warm_rows)
     lines += ["", "### Full stage breakdown", ""]
     lines += _stage_table(warm_rows)
@@ -476,15 +515,15 @@ def write_report(cold: dict, warm_cached: dict, voice: bool, reps: int, delay: f
     hits = sum(1 for r in cached_rows if r.get("cached"))
     lines += ["", f"Cache hits: **{hits}/{len(cached_rows)}**.", ""]
 
-    warm_total = percentiles(_metric_values(warm_rows, "total_ms"))
-    cached_total = percentiles(_metric_values(cached_rows, "total_ms"))
-    lines += ["## Verdict against the 200ms target", "", "| path | p50 | p95 | < 200ms? |", "| --- | --- | --- | --- |"]
+    warm_total = percentiles(_metric_values(warm_rows, "total_ms"), quantiles=(50, 100))
+    cached_total = percentiles(_metric_values(cached_rows, "total_ms"), quantiles=(50, 100))
+    lines += ["## Verdict against the 200ms target", "", "| path | p50 | p100 | < 200ms? |", "| --- | --- | --- | --- |"]
     for label, pct in (("warm uncached", warm_total), ("cached", cached_total)):
         if pct is None:
             lines.append(f"| {label} | n/a | n/a | no data |")
         else:
-            verdict = "**yes**" if pct["p95"] < 200 else "**no**"
-            lines.append(f"| {label} | {pct['p50']:.1f} ms | {pct['p95']:.1f} ms | {verdict} |")
+            verdict = "**yes**" if pct["p100"] < 200 else "**no**"
+            lines.append(f"| {label} | {pct['p50']:.1f} ms | {pct['p100']:.1f} ms | {verdict} |")
     lines.append("")
 
     report = "\n".join(lines) + "\n"

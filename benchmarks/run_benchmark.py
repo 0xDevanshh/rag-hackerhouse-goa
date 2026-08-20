@@ -30,7 +30,7 @@ load_dotenv(ROOT / ".env")
 
 from src import data_loader, generation  # noqa: E402
 from src.chunking import ChunkerRegistry  # noqa: E402
-from src.generation import Generator, LLMProvider  # noqa: E402
+from src.generation import ExtractiveProvider, Generator  # noqa: E402
 from src.harness import PipelineHarness, PipelineResult  # noqa: E402
 from src.stt import MockSTT, SarvamSTT  # noqa: E402
 from src.vectorstore import VectorStore  # noqa: E402
@@ -83,27 +83,11 @@ def _load_in_domain_queries(n: int = NUM_IN_DOMAIN_QUERIES) -> list[str]:
     return queries[:n]
 
 
-class _SimulatedProvider(LLMProvider):
-    """
-    Stand-in generation provider used only when no real GROQ_API_KEY or
-    ANTHROPIC_API_KEY is configured, so this benchmark can still run
-    end-to-end. Adds a small fixed delay rather than reporting a
-    meaningless ~0ms generation time. NOT representative of real LLM
-    latency — the report labels any numbers produced this way accordingly.
-    """
-
-    async def answer(self, query: str, retrieved_chunks) -> str:
-        await asyncio.sleep(0.05)
-        return "Simulated answer (no LLM_PROVIDER API key configured)."
-
-
-def _build_generator() -> tuple[Generator, bool]:
-    """Use the real configured provider if available, else a simulated one."""
-    try:
-        provider = generation.get_provider()
-        return Generator(provider=provider), True
-    except Exception:
-        return Generator(provider=_SimulatedProvider()), False
+def _build_generator() -> tuple[Generator, str]:
+    """Build the configured hosted provider or the local grounded provider."""
+    provider = generation.get_provider()
+    mode = "local-extractive" if isinstance(provider, ExtractiveProvider) else "hosted"
+    return Generator(provider=provider), mode
 
 
 def _load_corpus_chunks():
@@ -139,7 +123,15 @@ def _percentiles(values: list[float]) -> dict | None:
 # single 'retrieval' stage split into the four sub-spans below plus
 # 'retrieval_overhead'. The old 'generation' stage likewise split into
 # llm_network / llm_client_wait / llm_generation.
-_RETRIEVAL_SPANS = ("embedding_cache", "embedding_compute", "vector_search", "reranking", "retrieval_overhead")
+_RETRIEVAL_SPANS = (
+    "embedding_cache",
+    "embedding_compute",
+    "vector_search",
+    "bm25",
+    "fusion",
+    "reranking",
+    "retrieval_overhead",
+)
 _GENERATION_SPANS = ("llm_network", "llm_client_wait", "llm_generation")
 _RETRIEVAL_PIPELINE_SPANS = ("query_preprocessing", *_RETRIEVAL_SPANS, "relevance_guard")
 
@@ -196,7 +188,7 @@ def _generate_silent_wav(duration_seconds: float = 1.0, sample_rate: int = 16000
 
 
 async def run_in_process_benchmark() -> dict:
-    generator, generator_is_real = _build_generator()
+    generator, generation_mode = _build_generator()
     store = VectorStore()
     mock_stt = MockSTT()
     corpus_chunks = _load_corpus_chunks()
@@ -243,7 +235,7 @@ async def run_in_process_benchmark() -> dict:
             print(f"  ...{i + 1}/{len(all_queries)} queries done", file=sys.stderr)
 
     return {
-        "generator_is_real": generator_is_real,
+        "generation_mode": generation_mode,
         "corpus_size": len(corpus_chunks),
         "retrieval": _percentiles(retrieval_durations),
         "generation": _percentiles(generation_durations),
@@ -304,12 +296,11 @@ def write_report(in_process: dict, stt: dict) -> None:
         "",
     ]
 
-    if not in_process["generator_is_real"]:
+    if in_process["generation_mode"] == "local-extractive":
         lines += [
-            "> **Note:** no `GROQ_API_KEY`/`ANTHROPIC_API_KEY` was configured in this environment, so "
-            "generation used a simulated provider (fixed ~50ms delay) purely so the benchmark could run "
-            "end-to-end. **The generation and post-STT-total numbers below are NOT representative of "
-            "real LLM latency** — re-run with a real key configured to get meaningful figures.",
+            "> Generation used the local extractive provider. It performs no network call and returns only "
+            "the highest-ranked retrieved passage with a citation, so these are honest local pipeline "
+            "measurements rather than simulated LLM timings.",
             "",
         ]
 

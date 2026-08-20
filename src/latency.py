@@ -43,6 +43,8 @@ SPAN_ORDER: tuple[str, ...] = (
     "embedding_cache",
     "embedding_compute",
     "vector_search",
+    "bm25",
+    "fusion",
     "reranking",
     "relevance_guard",
     "context_build",

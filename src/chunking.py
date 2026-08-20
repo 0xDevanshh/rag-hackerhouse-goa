@@ -67,7 +67,17 @@ class FixedSizeChunker(Chunker):
                 chunks.append(
                     Chunk(
                         text=piece,
-                        metadata={"doc_id": doc_id, "start": start, "end": min(end, len(text))},
+                        metadata={
+                            "doc_id": doc_id,
+                            "document_id": doc_id,
+                            "chunk_id": f"{doc_id}:{start}",
+                            "chunk_type": "window",
+                            "language": doc.get("language", "unknown"),
+                            "source": doc.get("source", "unknown"),
+                            "position": start,
+                            "start": start,
+                            "end": min(end, len(text)),
+                        },
                         strategy_name="fixed_size",
                     )
                 )
@@ -75,6 +85,55 @@ class FixedSizeChunker(Chunker):
                 break
             start += step
         return chunks
+
+
+class SentenceChunker(Chunker):
+    """One offline chunk per sentence, preserving document order."""
+
+    def chunk(self, doc: dict[str, Any]) -> list[Chunk]:
+        doc_id = doc.get("id", doc.get("document_id"))
+        language = doc.get("language", "unknown")
+        source = doc.get("source", "unknown")
+        return [
+            Chunk(
+                text=sentence,
+                metadata={
+                    "document_id": doc_id,
+                    "chunk_id": f"{doc_id}:sentence:{position}",
+                    "chunk_type": "sentence",
+                    "language": language,
+                    "source": source,
+                    "position": position,
+                },
+                strategy_name="sentence",
+            )
+            for position, sentence in enumerate(_split_sentences(doc.get("text", "")))
+        ]
+
+
+class ParagraphChunker(Chunker):
+    """One offline chunk per non-empty paragraph."""
+
+    def chunk(self, doc: dict[str, Any]) -> list[Chunk]:
+        doc_id = doc.get("id", doc.get("document_id"))
+        language = doc.get("language", "unknown")
+        source = doc.get("source", "unknown")
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", doc.get("text", "")) if part.strip()]
+        return [
+            Chunk(
+                text=paragraph,
+                metadata={
+                    "document_id": doc_id,
+                    "chunk_id": f"{doc_id}:paragraph:{position}",
+                    "chunk_type": "paragraph",
+                    "language": language,
+                    "source": source,
+                    "position": position,
+                },
+                strategy_name="paragraph",
+            )
+            for position, paragraph in enumerate(paragraphs)
+        ]
 
 
 class SentenceSemanticChunker(Chunker):
@@ -106,10 +165,21 @@ class SentenceSemanticChunker(Chunker):
             return 0.0
         return float(np.dot(a, b) / denom)
 
-    def _make_chunk(self, sentences: list[str], doc_id: Any, chunk_index: int) -> Chunk:
+    def _make_chunk(self, sentences: list[str], doc: dict[str, Any], chunk_index: int) -> Chunk:
+        doc_id = doc.get("id", doc.get("document_id"))
         return Chunk(
             text=" ".join(sentences),
-            metadata={"doc_id": doc_id, "chunk_index": chunk_index, "num_sentences": len(sentences)},
+            metadata={
+                "doc_id": doc_id,
+                "document_id": doc_id,
+                "chunk_id": f"{doc_id}:{chunk_index}",
+                "chunk_type": "semantic",
+                "language": doc.get("language", "unknown"),
+                "source": doc.get("source", "unknown"),
+                "position": chunk_index,
+                "chunk_index": chunk_index,
+                "num_sentences": len(sentences),
+            },
             strategy_name="sentence_semantic",
         )
 
@@ -132,11 +202,11 @@ class SentenceSemanticChunker(Chunker):
                 current_sentences.append(sentence)
                 current_embeddings.append(embedding)
             else:
-                chunks.append(self._make_chunk(current_sentences, doc_id, len(chunks)))
+                chunks.append(self._make_chunk(current_sentences, doc, len(chunks)))
                 current_sentences = [sentence]
                 current_embeddings = [embedding]
 
-        chunks.append(self._make_chunk(current_sentences, doc_id, len(chunks)))
+        chunks.append(self._make_chunk(current_sentences, doc, len(chunks)))
         return chunks
 
 
@@ -168,7 +238,12 @@ class MetadataAwareChunker(Chunker):
                     text=passage.get("text", ""),
                     metadata={
                         "query_id": query_id,
+                        "document_id": query_id,
                         "passage_id": passage_id,
+                        "chunk_id": f"{query_id}:{language}:{passage_id}",
+                        "chunk_type": "metadata_aware",
+                        "source": doc.get("source", "msmarco_xi"),
+                        "position": passage_id,
                         "language": language,
                         "is_selected": bool(passage.get("is_selected", False)),
                         "query_text": query_text,
@@ -221,7 +296,16 @@ class RecursiveChunker(Chunker):
         return [
             Chunk(
                 text=piece,
-                metadata={"doc_id": doc_id, "chunk_index": i},
+                metadata={
+                    "doc_id": doc_id,
+                    "document_id": doc_id,
+                    "chunk_id": f"{doc_id}:{i}",
+                    "chunk_type": "recursive",
+                    "language": doc.get("language", "unknown"),
+                    "source": doc.get("source", "unknown"),
+                    "position": i,
+                    "chunk_index": i,
+                },
                 strategy_name="recursive",
             )
             for i, piece in enumerate(merged)
@@ -233,7 +317,11 @@ class ChunkerRegistry:
 
     _strategies: dict[str, type[Chunker]] = {
         "fixed_size": FixedSizeChunker,
+        "sliding_window": FixedSizeChunker,
+        "sentence": SentenceChunker,
+        "paragraph": ParagraphChunker,
         "sentence_semantic": SentenceSemanticChunker,
+        "semantic": SentenceSemanticChunker,
         "metadata_aware": MetadataAwareChunker,
         "recursive": RecursiveChunker,
     }
