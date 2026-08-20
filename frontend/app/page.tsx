@@ -4,29 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import type { PipelineResult, RequestTrace } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const MOTION_MS = 200;
 
 type BackendStatus = "checking" | "up" | "down";
 type UiState = "idle" | "recording" | "processing" | "result" | "error";
-
-interface SentenceEvent {
-  event: "sentence";
-  text: string;
-}
-
-interface DoneEvent {
-  event: "done";
-  result: PipelineResult;
-}
-
-function parseSseFrame(frame: string): { event: string; data: string } | null {
-  let eventType = "message";
-  let data = "";
-  for (const line of frame.split("\n")) {
-    if (line.startsWith("event:")) eventType = line.slice(6).trim();
-    else if (line.startsWith("data:")) data += line.slice(5).trim();
-  }
-  return data ? { event: eventType, data } : null;
-}
 
 /**
  * Total duration of the named spans, or null if none of them ran.
@@ -92,12 +73,50 @@ export default function Home() {
   const [uiState, setUiState] = useState<UiState>("idle");
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [streamingAnswer, setStreamingAnswer] = useState("");
+  const [liveTranscript, setLiveTranscript] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const realtimeSocketRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
+
+  const sendPcmFrame = (samples: Float32Array, inputRate: number) => {
+    const ratio = inputRate / 16000;
+    const outputLength = Math.floor(samples.length / ratio);
+    const pcm = new Int16Array(outputLength);
+    for (let i = 0; i < outputLength; i += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[Math.floor(i * ratio)]));
+      pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    let binary = "";
+    const bytes = new Uint8Array(pcm.buffer);
+    for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+    realtimeSocketRef.current?.send(JSON.stringify({ event: "audio_input", audio: btoa(binary) }));
+  };
+
+  const finishRealtimeAudio = () => {
+    processorRef.current?.disconnect();
+    audioSourceRef.current?.disconnect();
+    audioContextRef.current?.close();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    processorRef.current = null;
+    audioSourceRef.current = null;
+    audioContextRef.current = null;
+  };
+
+  const submitTranscript = async (transcript: string) => {
+    const res = await fetch(`${API_URL}/query/text`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: transcript }),
+    });
+    if (!res.ok) throw new Error(`RAG request failed with status ${res.status}`);
+    setResult((await res.json()) as PipelineResult);
+    setUiState("result");
+  };
 
   const pingBackend = async () => {
     try {
@@ -131,91 +150,53 @@ export default function Home() {
     };
   }, []);
 
-  const sendAudio = async (blob: Blob) => {
-    setUiState("processing");
-    setErrorMessage(null);
-    setResult(null);
-    setStreamingAnswer("");
-    setIsStreaming(true);
-
-    try {
-      const formData = new FormData();
-      const extension = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
-      formData.append("audio", blob, `recording.${extension}`);
-
-      const res = await fetch(`${API_URL}/query/stream`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok || !res.body) {
-        const detail = await res.json().catch(() => null);
-        throw new Error(detail?.detail || `Request failed with status ${res.status}`);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let frameEnd;
-        while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
-          const frame = buffer.slice(0, frameEnd);
-          buffer = buffer.slice(frameEnd + 2);
-          const parsed = parseSseFrame(frame);
-          if (!parsed) continue;
-
-          if (parsed.event === "sentence") {
-            const payload = JSON.parse(parsed.data) as SentenceEvent;
-            setStreamingAnswer((prev) => (prev ? `${prev} ${payload.text}` : payload.text));
-            setUiState("result");
-          } else if (parsed.event === "done") {
-            const payload = JSON.parse(parsed.data) as DoneEvent;
-            setResult(payload.result);
-            setIsStreaming(false);
-            setUiState("result");
-          }
-        }
-      }
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Something went wrong while contacting the backend.");
-      setUiState("error");
-    } finally {
-      setIsStreaming(false);
-    }
-  };
-
   const startRecording = async () => {
     setErrorMessage(null);
-    if (typeof MediaRecorder === "undefined") {
-      setErrorMessage("This browser doesn't support audio recording (MediaRecorder API unavailable).");
+    if (typeof AudioContext === "undefined" || typeof WebSocket === "undefined") {
+      setErrorMessage("This browser doesn't support realtime audio capture.");
       setUiState("error");
       return;
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      chunksRef.current = [];
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
+      setLiveTranscript("");
+      const socket = new WebSocket(`${API_URL.replace(/^http/, "ws")}/stt/realtime`);
+      realtimeSocketRef.current = socket;
+      socket.onmessage = (event) => {
+        const message = JSON.parse(event.data) as { event?: string; text?: string };
+        if (message.event === "transcript.partial" && message.text) setLiveTranscript(message.text);
+        if (message.event === "transcript.final" && message.text) {
+          setLiveTranscript(message.text);
+          finishRealtimeAudio();
+          socket.close();
+          submitTranscript(message.text).catch((error: unknown) => {
+            setErrorMessage(error instanceof Error ? error.message : "Could not answer the transcript.");
+            setUiState("error");
+          });
+        }
       };
-
-      mediaRecorder.onstop = () => {
-        streamRef.current?.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunksRef.current, { type: mediaRecorder.mimeType || "audio/webm" });
-        sendAudio(blob);
+      socket.onerror = () => {
+        finishRealtimeAudio();
+        setErrorMessage("Realtime speech recognition is unavailable.");
+        setUiState("error");
       };
-
-      mediaRecorder.start();
-      setUiState("recording");
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener("open", () => resolve(), { once: true });
+        socket.addEventListener("error", () => reject(new Error("Realtime speech connection failed.")), { once: true });
+      });
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(2048, 1, 1);
+      processor.onaudioprocess = (event) => sendPcmFrame(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
+      source.connect(processor);
+      processor.connect(audioContext.destination);
+      audioContextRef.current = audioContext;
+      audioSourceRef.current = source;
+      processorRef.current = processor;
+      requestAnimationFrame(() => {
+        setUiState("recording");
+      });
     } catch {
       setErrorMessage("Microphone access was denied or is unavailable.");
       setUiState("error");
@@ -223,7 +204,11 @@ export default function Home() {
   };
 
   const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
+    finishRealtimeAudio();
+    realtimeSocketRef.current?.send(JSON.stringify({ event: "end" }));
+    window.setTimeout(() => {
+      setUiState("processing");
+    }, MOTION_MS);
   };
 
   const handleRecordClick = () => {
@@ -238,6 +223,7 @@ export default function Home() {
   const reset = () => {
     setResult(null);
     setStreamingAnswer("");
+    setLiveTranscript("");
     setIsStreaming(false);
     setErrorMessage(null);
     setUiState("idle");
@@ -288,6 +274,13 @@ export default function Home() {
           {uiState === "error" && "Tap Record to try again"}
         </div>
       </div>
+
+      {uiState === "recording" && liveTranscript && (
+        <div className="card">
+          <h2>Live transcript</h2>
+          <p className="queryText">{liveTranscript}</p>
+        </div>
+      )}
 
       {uiState === "error" && errorMessage && (
         <div className="errorBox">

@@ -13,6 +13,8 @@ import logging
 import os
 import sys
 import uuid
+import asyncio
+import json as json_module
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,10 +27,11 @@ if __name__ == "__main__" and str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import websockets
 
 from src import data_loader
 from src.chunking import ChunkerRegistry
@@ -328,6 +331,57 @@ def _request_trace(request: Request) -> RequestTrace:
 def health() -> dict:
     """Liveness check for the frontend to confirm the backend is reachable."""
     return {"status": "ok"}
+
+
+@app.websocket("/stt/realtime")
+async def stt_realtime(websocket: WebSocket) -> None:
+    """Proxy browser PCM frames to Sarvam realtime STT without exposing the key."""
+    await websocket.accept()
+    api_key = os.environ.get("SARVAM_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        await websocket.close(code=1011, reason="SARVAM_API_KEY is not configured")
+        return
+
+    query = (
+        "language_code=auto&model=saaras:v3-realtime&stream_type=fast&"
+        "endpointing=vad&encoding=linear16&sample_rate=16000&mode=transcribe&"
+        "prefix_padding_ms=100&silence_duration_ms=300&min_speech_duration_ms=100"
+    )
+    upstream_url = f"wss://api.sarvam.ai/speech-to-text-realtime/ws?{query}"
+    try:
+        async with websockets.connect(
+            upstream_url,
+            subprotocols=[f"api-subscription-key.{api_key}"],
+            ping_interval=20,
+            open_timeout=10,
+        ) as upstream:
+            async def client_to_sarvam() -> None:
+                while True:
+                    message = await websocket.receive_text()
+                    json_module.loads(message)
+                    await upstream.send(message)
+
+            async def sarvam_to_client() -> None:
+                async for message in upstream:
+                    await websocket.send_text(message)
+
+            forward_task = asyncio.create_task(client_to_sarvam())
+            receive_task = asyncio.create_task(sarvam_to_client())
+            done, pending = await asyncio.wait(
+                {forward_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exception = task.exception()
+                if exception and not isinstance(exception, (WebSocketDisconnect, websockets.ConnectionClosed)):
+                    raise exception
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        logger.warning("realtime STT proxy closed: %s", exc)
+        if websocket.client_state.value == "CONNECTED":
+            await websocket.close(code=1011, reason="realtime STT unavailable")
 
 
 @app.get("/ready")

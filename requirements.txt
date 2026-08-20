@@ -9,6 +9,7 @@ python-multipart
 anthropic
 groq
 requests
+websockets
 python-dotenv
 tenacity
 pytest
