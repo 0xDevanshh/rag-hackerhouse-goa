@@ -10,6 +10,7 @@ interface each backend implements.
 
 import logging
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
@@ -218,17 +219,36 @@ class LLMProvider(ABC):
 
 
 class ExtractiveProvider(LLMProvider):
-    """Local zero-network fallback that returns only retrieved evidence."""
+    """Local zero-network answerer using lexical evidence selection."""
 
     model = "local-extractive"
 
     async def answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> str:
         if not retrieved_chunks:
             return NO_CONTEXT_RESPONSE
-        chunk, _ = retrieved_chunks[0]
-        passage_id = chunk.metadata.get("passage_id", chunk.metadata.get("doc_id", "unknown"))
-        text = " ".join(chunk.text.split())
-        return f"{text[:800].rstrip()} [passage_id: {passage_id}]"
+        query_terms = set(re.findall(r"\w+", query.casefold()))
+        selected: list[str] = []
+        seen: set[str] = set()
+        for chunk, score in retrieved_chunks[:5]:
+            passage_id = chunk.metadata.get("passage_id", chunk.metadata.get("doc_id", "unknown"))
+            for sentence in re.split(r"(?<=[.!?।])\s+", " ".join(chunk.text.split())):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                key = sentence.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                sentence_terms = set(re.findall(r"\w+", key))
+                overlap = len(query_terms & sentence_terms) / max(len(query_terms), 1)
+                rank_score = overlap + min(float(score), 1.0) * 0.25
+                if rank_score > 0 or not selected:
+                    selected.append((rank_score, sentence, passage_id))
+        if not selected:
+            return NO_CONTEXT_RESPONSE
+        selected.sort(key=lambda item: item[0], reverse=True)
+        answer_parts = [f"{sentence} [passage_id: {passage_id}]" for _, sentence, passage_id in selected[:3]]
+        return " ".join(answer_parts)
 
     async def stream_answer(
         self,
@@ -247,92 +267,8 @@ class ExtractiveProvider(LLMProvider):
             timing["llm_total_ms"] = elapsed
         yield answer
 
-    async def answer_streamed(
-        self,
-        query: str,
-        retrieved_chunks: list[tuple[Chunk, float]],
-        timing: dict[str, Any] | None = None,
-        max_attempts: int = 3,
-    ) -> str:
-        """
-        Produce a complete answer over the *streaming* transport, returning
-        the joined text.
-
-        This exists so the non-streaming route can report a real
-        `llm_ttft_ms`. Time-to-first-token is not observable through a
-        buffered completion call — the SDK returns once, at the end — which is
-        why the original trace reported `llm_ttft_ms: n/a` on /query and left
-        the single largest remaining stage as one opaque number. Measured
-        end-to-end cost is the same either way for this workload
-        (gpt-oss-20b: streamed total p50 595ms vs buffered p50 593ms), so
-        nothing is traded away for the visibility.
-
-        Retries are attempted only while no delta has been yielded yet.
-        Once the model has emitted text, a restart would either duplicate or
-        silently discard already-generated output, so the failure is
-        propagated instead.
-
-        Raises:
-            GenerationError: if every attempt fails before first token, or any
-            failure occurs after streaming has begun.
-        """
-        import asyncio
-
-        call_started = time.perf_counter()
-        last_exc: Exception | None = None
-        attempts = 0
-
-        def account() -> None:
-            """
-            Attribute everything this method spent that the last attempt's own
-            timings don't cover — failed attempts plus backoff sleeps — to
-            llm_retry_wait_ms.
-
-            Without this, a rate-limited request's retry budget lands in the
-            request-level unaccounted_ms: a 20-request benchmark run against
-            Groq's free tier produced unaccounted_ms of 525ms at p50 and 3.2s
-            at p95, all of it backoff. That is exactly the class of hidden
-            latency this instrumentation exists to expose, so it gets a name
-            rather than a residual.
-            """
-            if timing is None:
-                return
-            timing["llm_attempts"] = attempts
-            overhead = (time.perf_counter() - call_started) * 1000 - timing.get("llm_total_ms", 0.0)
-            if overhead > 0:
-                timing["llm_retry_wait_ms"] = overhead
-
-        for attempt in range(max_attempts):
-            attempts = attempt + 1
-            deltas: list[str] = []
-            try:
-                async for delta in self.stream_answer(query, retrieved_chunks, timing=timing):
-                    deltas.append(delta)
-                account()
-                return "".join(deltas).strip()
-            except Exception as exc:
-                if deltas:
-                    account()
-                    raise GenerationError(
-                        f"generation failed after {len(deltas)} deltas had already streamed: {exc}"
-                    ) from exc
-                last_exc = exc
-                if attempt < max_attempts - 1:
-                    backoff = min(2**attempt, 10)
-                    logger.warning(
-                        "generation attempt %d/%d failed before first token (%s); retrying in %ss",
-                        attempt + 1,
-                        max_attempts,
-                        type(exc).__name__,
-                        backoff,
-                    )
-                    await asyncio.sleep(backoff)
-        account()
-        raise GenerationError(f"generation failed after {max_attempts} attempts: {last_exc}") from last_exc
-
-
 class GroqProvider(LLMProvider):
-    """Generates answers via the Groq API (OpenAI-compatible chat completions)."""
+    """Generates answers through the optional hosted Groq provider."""
 
     def __init__(self, model: str = DEFAULT_GROQ_MODEL, max_tokens: int = DEFAULT_MAX_TOKENS):
         api_key = os.environ.get("GROQ_API_KEY")
@@ -348,61 +284,6 @@ class GroqProvider(LLMProvider):
         wait=wait_exponential(multiplier=1, min=1, max=10),
         reraise=True,
     )
-    async def _create_completion(self, user_message: str):
-        return await self.client.chat.completions.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-        )
-
-    async def prewarm(self) -> float:
-        started = time.perf_counter()
-        try:
-            await self.client.models.list()
-        except Exception as exc:
-            logger.warning("Groq prewarm failed (%s); first request will pay TLS setup", exc)
-        return (time.perf_counter() - started) * 1000
-
-    async def answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]]) -> str:
-        try:
-            response = await self._create_completion(_build_user_message(query, retrieved_chunks))
-        except Exception as exc:
-            raise GenerationError(f"Groq generation failed after retries: {exc}") from exc
-        return response.choices[0].message.content.strip()
-
-    async def stream_answer(self, query: str, retrieved_chunks: list[tuple[Chunk, float]], timing=None):
-        request_started = time.perf_counter()
-        headers_at = first_token_at = None
-        finish_reason = None
-        try:
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _build_user_message(query, retrieved_chunks)},
-                ],
-                stream=True,
-            )
-            headers_at = time.perf_counter()
-            async for chunk in stream:
-                choice = chunk.choices[0]
-                if choice.finish_reason:
-                    finish_reason = choice.finish_reason
-                if choice.delta.content:
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-                    yield choice.delta.content
-        except Exception as exc:
-            raise GenerationError(f"Groq streaming generation failed: {exc}") from exc
-        finally:
-            if timing is not None:
-                _record_llm_timing(timing, request_started, headers_at, first_token_at)
-                if finish_reason:
-                    timing["llm_finish_reason"] = finish_reason
     async def _create_completion(self, user_message: str):
         return await self.client.chat.completions.create(
             model=self.model,

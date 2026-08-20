@@ -29,7 +29,14 @@ from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_expo
 from src import stt
 from src.chunking import Chunk
 from src.generation import DEFAULT_MAX_TOKENS, SYSTEM_PROMPT, Generator, _build_user_message
-from src.guardrails import REFUSAL_RESPONSE, GroundingGuardrail, GuardResult, InputGuardrail, RelevanceGuardrail
+from src.guardrails import (
+    REFUSAL_RESPONSE,
+    GroundingGuardrail,
+    GuardResult,
+    InputGuardrail,
+    RelevanceGuardrail,
+    normalize_query_input,
+)
 from src.latency import RequestTrace
 from src.retrieval import Retriever, RetrievalResult
 from src.text import SENTENCE_BOUNDARY_RE as _SENTENCE_BOUNDARY_RE
@@ -569,7 +576,9 @@ class PipelineHarness:
                     )
                 )
         else:
-            query_text = audio_or_text_input
+            query_text = normalize_query_input(audio_or_text_input)
+
+        query_text = normalize_query_input(query_text)
 
         # Fast path: the answer cache, consulted before embedding, retrieval,
         # or generation. For a text query this is the whole request; for audio

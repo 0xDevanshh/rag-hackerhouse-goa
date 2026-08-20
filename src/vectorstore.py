@@ -54,7 +54,9 @@ def _configure_cpu_threads() -> None:
         torch.set_num_threads(EMBEDDING_TORCH_THREADS)
 
 
-DEFAULT_EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+DEFAULT_EMBEDDING_MODEL_NAME = os.environ.get(
+    "EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+)
 
 # Device the embedding model runs on.
 #
@@ -195,6 +197,7 @@ class Embedder:
                 torch.get_num_threads(),
             )
             self._model_cache[key] = SentenceTransformer(model_name, device=self.device)
+            self._model_cache[key].max_seq_length = min(self._model_cache[key].max_seq_length, 64)
             self._model_cache[key].eval()
         self._model = self._model_cache[key]
 
@@ -348,7 +351,7 @@ class VectorStore:
             # use_cache=False: see Embedder.encode — bulk indexing must not
             # evict the query cache. batch_size well above the per-query
             # default, since this path is throughput-bound, not latency-bound.
-            self.embedder.encode([chunk.text for chunk in chunks], use_cache=False, batch_size=64),
+            self.embedder.encode([chunk.text for chunk in chunks], use_cache=False, batch_size=256),
             dtype=np.float32,
         )
         dim = embeddings.shape[1]

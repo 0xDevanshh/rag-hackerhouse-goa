@@ -9,6 +9,8 @@ supported by the retrieved context before it reaches the user.
 """
 
 import re
+import unicodedata
+from collections import Counter
 
 import numpy as np
 from pydantic import BaseModel
@@ -19,6 +21,27 @@ from src.text import split_sentences as _split_sentences
 from src.vectorstore import Embedder
 
 REFUSAL_RESPONSE = "I don't have enough information in the dataset to answer that."
+MAX_QUERY_CHARS = 256
+MAX_QUERY_TOKENS = 64
+_QUERY_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def normalize_query_input(text: str) -> str:
+    """Normalize and bound user text before any model or retrieval work."""
+    normalized = " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+    tokens = _QUERY_TOKEN_RE.findall(normalized)
+    if len(tokens) > MAX_QUERY_TOKENS:
+        normalized = " ".join(tokens[:MAX_QUERY_TOKENS])
+    return normalized[:MAX_QUERY_CHARS].rstrip()
+
+
+def _is_repetitive_query(text: str) -> bool:
+    tokens = _QUERY_TOKEN_RE.findall(text)
+    if len(tokens) < 24:
+        return False
+    unique_ratio = len(set(tokens)) / len(tokens)
+    repeated_terms = Counter(tokens).most_common(3)
+    return unique_ratio < 0.28 or (repeated_terms and repeated_terms[0][1] / len(tokens) > 0.35)
 
 
 class GuardResult(BaseModel):
@@ -77,10 +100,13 @@ class InputGuardrail:
             all checks; otherwise allowed=False with a reason code and a
             canned response_override.
         """
-        stripped = query.strip()
+        stripped = normalize_query_input(query)
 
         if not stripped or len(stripped) < self.MIN_LENGTH:
             return GuardResult(allowed=False, reason="empty_query", response_override=REFUSAL_RESPONSE)
+
+        if _is_repetitive_query(stripped):
+            return GuardResult(allowed=False, reason="repetitive_query", response_override=REFUSAL_RESPONSE)
 
         for pattern in self.UNSAFE_PATTERNS:
             if pattern.search(stripped):
@@ -221,10 +247,13 @@ class GroundingGuardrail:
         # The local extractive provider returns a literal prefix of the top
         # passage followed by its citation. Exact evidence needs no second
         # embedding pass; preserving this check keeps the fast path grounded.
-        citation_match = re.search(r"\s*\[passage_id:\s*[^\]]+\]\s*$", answer_text)
-        if citation_match:
-            evidence = answer_text[: citation_match.start()].strip()
-            if evidence and any(evidence in chunk.text for chunk in retrieved_chunks):
+        cited_evidence = re.sub(r"\s*\[passage_id:\s*[^\]]+\]", "", answer_text).strip()
+        if re.search(r"\[passage_id:\s*[^\]]+\]", answer_text) and cited_evidence:
+            evidence_sentences = _split_sentences(cited_evidence)
+            if evidence_sentences and all(
+                any(sentence.strip() in chunk.text for chunk in retrieved_chunks)
+                for sentence in evidence_sentences
+            ):
                 return GuardResult(allowed=True, reason="exact_retrieved_evidence")
 
         chunk_vectors = self._chunk_vectors(retrieved_chunks, chunk_embeddings, timing)

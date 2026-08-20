@@ -15,6 +15,7 @@ benchmarking against a 2-chunk toy corpus would say nothing about production.
 
 import asyncio
 import io
+import os
 import random
 import sys
 import time
@@ -84,9 +85,13 @@ def _load_in_domain_queries(n: int = NUM_IN_DOMAIN_QUERIES) -> list[str]:
 
 
 def _build_generator() -> tuple[Generator, str]:
-    """Build the configured hosted provider or the local grounded provider."""
-    provider = generation.get_provider()
-    mode = "local-extractive" if isinstance(provider, ExtractiveProvider) else "hosted"
+    """Use local grounded generation for the benchmark unless explicitly opted out."""
+    if os.environ.get("BENCHMARK_GENERATION_MODE", "fast").lower() == "fast":
+        provider = ExtractiveProvider()
+        mode = "local-extractive"
+    else:
+        provider = generation.get_provider()
+        mode = "hosted"
     return Generator(provider=provider), mode
 
 
@@ -114,7 +119,7 @@ def _percentiles(values: list[float]) -> dict | None:
             return ordered[floor_i]
         return ordered[floor_i] + (ordered[ceil_i] - ordered[floor_i]) * (k - floor_i)
 
-    return {"p50": pct(50), "p70": pct(70), "p100": pct(100), "n": len(ordered)}
+    return {f"p{p}": pct(p) for p in (50, 70, 90, 95, 99, 100)} | {"n": len(ordered)}
 
 
 # Migrated from the old LatencyTrace to src/latency.RequestTrace. The stage
@@ -229,6 +234,8 @@ async def run_in_process_benchmark() -> dict:
                 "guard_flags": {k: v.allowed for k, v in result.guard_flags.items()},
                 "retrieval_pipeline_ms": retrieval_pipeline_ms,
                 "post_stt_total_ms": post_stt_total_ms,
+                "error_stages": [error.stage for error in result.errors],
+                "guard_reasons": {key: value.reason for key, value in result.guard_flags.items()},
             }
         )
         if (i + 1) % 20 == 0:
@@ -272,7 +279,7 @@ def run_stt_benchmark() -> dict:
 def _format_pct_row(label: str, pct: dict | None) -> str:
     if pct is None:
         return f"| {label} | n/a | n/a | n/a | 0 |"
-    return f"| {label} | {pct['p50']:.1f} ms | {pct['p70']:.1f} ms | {pct['p100']:.1f} ms | {pct['n']} |"
+    return f"| {label} | {pct['p50']:.1f} ms | {pct['p70']:.1f} ms | {pct['p90']:.1f} ms | {pct['p95']:.1f} ms | {pct['p99']:.1f} ms | {pct['p100']:.1f} ms | {pct['n']} |"
 
 
 def _verdict(pct: dict | None, target_ms: float) -> str:
@@ -320,8 +327,8 @@ def write_report(in_process: dict, stt: dict) -> None:
         "",
         "## Stage breakdown",
         "",
-        "| Stage | P50 | P70 | P100 (max) | Samples |",
-        "|---|---|---|---|---|",
+        "| Stage | P50 | P70 | P90 | P95 | P99 | P100 (max) | Samples |",
+        "|---|---|---|---|---|---|---|---|",
         _format_pct_row("Retrieval (embed + FAISS + rerank) only", in_process["retrieval"]),
         _format_pct_row("Generation only", in_process["generation"]),
         _format_pct_row(f"**Retrieval pipeline** (target < {RETRIEVAL_TARGET_MS}ms)", in_process["retrieval_pipeline"]),
