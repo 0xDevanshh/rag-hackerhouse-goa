@@ -316,7 +316,18 @@ class PipelineHarness:
         except Exception as exc:
             logger.warning("LLM prewarm skipped (%s)", exc)
         if self.stt_client is not None:
-            timings["stt_prewarm_ms"] = await asyncio.to_thread(self.stt_client.prewarm)
+            # STT clients come in both flavours: the REST clients expose a
+            # blocking prewarm (a GET, to pay the TLS handshake), the realtime
+            # WebSocket clients an async one. asyncio.to_thread on an async
+            # function would hand back an un-awaited coroutine, which then
+            # fails the float formatting below and takes startup down with it —
+            # dormant today only because stt_client is lazily None at startup.
+            # Dispatch on which kind it actually is.
+            prewarm_stt = self.stt_client.prewarm
+            if asyncio.iscoroutinefunction(prewarm_stt):
+                timings["stt_prewarm_ms"] = await prewarm_stt()
+            else:
+                timings["stt_prewarm_ms"] = await asyncio.to_thread(prewarm_stt)
         logger.info("prewarm: %s", " ".join(f"{k}={v:.1f}" for k, v in timings.items()))
         return timings
 
