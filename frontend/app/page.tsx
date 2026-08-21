@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PipelineResult, RequestTrace } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const MOTION_MS = 200;
+const AUDIO_BUFFER_SIZE = 512;
 
 type BackendStatus = "checking" | "up" | "down";
 type UiState = "idle" | "recording" | "processing" | "result" | "error";
@@ -81,9 +82,19 @@ export default function Home() {
   const realtimeSocketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const sttTimingRef = useRef({
+    audioAvailableMs: null as number | null,
+    firstAudioSentMs: null as number | null,
+    firstPartialReceivedMs: null as number | null,
+    firstPartialText: "",
+  });
 
   const sendPcmFrame = (samples: Float32Array, inputRate: number) => {
+    const now = performance.now();
+    if (sttTimingRef.current.audioAvailableMs === null) {
+      sttTimingRef.current.audioAvailableMs = now;
+    }
     const ratio = inputRate / 16000;
     const outputLength = Math.floor(samples.length / ratio);
     const pcm = new Int16Array(outputLength);
@@ -94,15 +105,21 @@ export default function Home() {
     let binary = "";
     const bytes = new Uint8Array(pcm.buffer);
     for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-    realtimeSocketRef.current?.send(JSON.stringify({ event: "audio_input", audio: btoa(binary) }));
+    const socket = realtimeSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ event: "audio_input", audio: btoa(binary) }));
+      if (sttTimingRef.current.firstAudioSentMs === null) {
+        sttTimingRef.current.firstAudioSentMs = performance.now();
+      }
+    }
   };
 
   const finishRealtimeAudio = () => {
-    processorRef.current?.disconnect();
+    workletRef.current?.disconnect();
     audioSourceRef.current?.disconnect();
     audioContextRef.current?.close();
     streamRef.current?.getTracks().forEach((track) => track.stop());
-    processorRef.current = null;
+    workletRef.current = null;
     audioSourceRef.current = null;
     audioContextRef.current = null;
   };
@@ -150,6 +167,20 @@ export default function Home() {
     };
   }, []);
 
+  useLayoutEffect(() => {
+    const timing = sttTimingRef.current;
+    if (timing.firstPartialReceivedMs !== null && liveTranscript === timing.firstPartialText) {
+      const renderedMs = performance.now();
+      console.info("stt_first_partial_latency", {
+        capture_to_render_ms: renderedMs - (timing.audioAvailableMs ?? renderedMs),
+        capture_to_send_ms: (timing.firstAudioSentMs ?? renderedMs) - (timing.audioAvailableMs ?? renderedMs),
+        send_to_receive_ms: timing.firstPartialReceivedMs - (timing.firstAudioSentMs ?? timing.firstPartialReceivedMs),
+        receive_to_render_ms: renderedMs - timing.firstPartialReceivedMs,
+      });
+      timing.firstPartialText = "";
+    }
+  }, [liveTranscript]);
+
   const startRecording = async () => {
     setErrorMessage(null);
     if (typeof AudioContext === "undefined" || typeof WebSocket === "undefined") {
@@ -161,11 +192,37 @@ export default function Home() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       setLiveTranscript("");
-      const socket = new WebSocket(`${API_URL.replace(/^http/, "ws")}/stt/realtime`);
+      sttTimingRef.current = {
+        audioAvailableMs: null,
+        firstAudioSentMs: null,
+        firstPartialReceivedMs: null,
+        firstPartialText: "",
+      };
+      const configResponse = await fetch(`${API_URL}/stt/realtime/config`);
+      const realtimeConfig = configResponse.ok
+        ? (await configResponse.json()) as {
+            direct?: boolean;
+            url?: string;
+            protocol?: string;
+            query?: Record<string, string>;
+          }
+        : null;
+      const socketUrl = realtimeConfig?.direct && realtimeConfig.url && realtimeConfig.query
+        ? `${realtimeConfig.url}?${new URLSearchParams(realtimeConfig.query)}`
+        : `${API_URL.replace(/^http/, "ws")}/stt/realtime`;
+      const socket = realtimeConfig?.direct && realtimeConfig.protocol
+        ? new WebSocket(socketUrl, realtimeConfig.protocol)
+        : new WebSocket(socketUrl);
       realtimeSocketRef.current = socket;
       socket.onmessage = (event) => {
         const message = JSON.parse(event.data) as { event?: string; text?: string };
-        if (message.event === "transcript.partial" && message.text) setLiveTranscript(message.text);
+        if (message.event === "transcript.partial" && message.text) {
+          if (sttTimingRef.current.firstPartialReceivedMs === null) {
+            sttTimingRef.current.firstPartialReceivedMs = performance.now();
+            sttTimingRef.current.firstPartialText = message.text;
+          }
+          setLiveTranscript(message.text);
+        }
         if (message.event === "transcript.final" && message.text) {
           setLiveTranscript(message.text);
           finishRealtimeAudio();
@@ -187,13 +244,19 @@ export default function Home() {
       });
       const audioContext = new AudioContext({ sampleRate: 16000 });
       const source = audioContext.createMediaStreamSource(stream);
-      const processor = audioContext.createScriptProcessor(2048, 1, 1);
-      processor.onaudioprocess = (event) => sendPcmFrame(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
-      source.connect(processor);
-      processor.connect(audioContext.destination);
+      if (!audioContext.audioWorklet) throw new Error("AudioWorklet is required for realtime capture.");
+      await audioContext.audioWorklet.addModule("/audio-capture-worklet.js");
+      const worklet = new AudioWorkletNode(audioContext, "audio-capture-processor");
+      worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        sendPcmFrame(event.data, audioContext.sampleRate);
+      };
+      source.connect(worklet);
+      // Keep the graph active without monitoring the microphone. The worklet
+      // emits silent output, so captured audio cannot echo through speakers.
+      worklet.connect(audioContext.destination);
+      workletRef.current = worklet;
       audioContextRef.current = audioContext;
       audioSourceRef.current = source;
-      processorRef.current = processor;
       requestAnimationFrame(() => {
         setUiState("recording");
       });
