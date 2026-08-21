@@ -403,18 +403,59 @@ export default function Home() {
                 </tr>
               </thead>
               <tbody>
-                <tr>
-                  <td>Speech-to-text</td>
-                  <td>{formatMs(spanTotal(result.trace, "stt_network"))}</td>
-                </tr>
+                {/* ── Serial STT path (/query) ── */}
+                {spanTotal(result.trace, "stt_network") !== null && (
+                  <tr>
+                    <td>Speech-to-text (batch)</td>
+                    <td>{formatMs(spanTotal(result.trace, "stt_network"))}</td>
+                  </tr>
+                )}
+                {/* ── Overlapped STT path (/query/realtime) ── */}
+                {spanTotal(result.trace, "stt_final") !== null && (
+                  <>
+                    <tr>
+                      <td>
+                        STT → first partial
+                        <span className="stageNote">time until first transcript.partial</span>
+                      </td>
+                      <td>{formatMs(spanTotal(result.trace, "stt_to_first_partial"))}</td>
+                    </tr>
+                    <tr>
+                      <td>
+                        STT total
+                        <span className="stageNote">stream open → transcript.final</span>
+                      </td>
+                      <td>{formatMs(spanTotal(result.trace, "stt_final"))}</td>
+                    </tr>
+                    <tr>
+                      <td>
+                        Retrieval (on stable partial)
+                        <span className="stageNote">ran concurrently with STT</span>
+                      </td>
+                      <td>{formatMs(spanTotal(result.trace, "retrieval_on_partial"))}</td>
+                    </tr>
+                    {spanTotal(result.trace, "stt_overlap_savings") !== null && (
+                      <tr className="overlapSavingsRow">
+                        <td>
+                          ⚡ Overlap savings
+                          <span className="stageNote">retrieval ms hidden inside STT</span>
+                        </td>
+                        <td>−{formatMs(spanTotal(result.trace, "stt_overlap_savings"))}</td>
+                      </tr>
+                    )}
+                  </>
+                )}
+                {/* ── Common stages ── */}
                 <tr>
                   <td>Embedding</td>
                   <td>{formatMs(spanTotal(result.trace, "embedding_cache", "embedding_compute"))}</td>
                 </tr>
-                <tr>
-                  <td>Retrieval</td>
-                  <td>{formatMs(spanTotal(result.trace, "vector_search", "bm25", "fusion", "reranking", "retrieval_overhead"))}</td>
-                </tr>
+                {spanTotal(result.trace, "stt_final") === null && (
+                  <tr>
+                    <td>Retrieval</td>
+                    <td>{formatMs(spanTotal(result.trace, "vector_search", "bm25", "fusion", "reranking", "retrieval_overhead"))}</td>
+                  </tr>
+                )}
                 <tr>
                   <td>BM25 lexical search</td>
                   <td>{formatMs(spanTotal(result.trace, "bm25"))}</td>
@@ -461,11 +502,11 @@ export default function Home() {
                   </td>
                 </tr>
                 <tr className="latencyTotalRow">
-                  <td>RAG total</td>
+                  <td>Processing (excl. speech recognition)</td>
                   <td>{formatMs(ragTotalMs(result.trace))}</td>
                 </tr>
                 <tr className="latencyTotalRow">
-                  <td>Full voice total</td>
+                  <td>Full end-to-end total</td>
                   <td>{formatMs(totalMs(result.trace))}</td>
                 </tr>
               </tbody>

@@ -594,6 +594,79 @@ async def query(audio: UploadFile = File(...), request: Request = None) -> Pipel
     return result
 
 
+@app.post("/query/realtime", response_model=PipelineResult)
+async def query_realtime(audio: UploadFile = File(...), request: Request = None) -> PipelineResult:
+    """
+    Lowest-latency audio path: overlaps retrieval with STT by firing retrieval
+    on the first *stable* partial transcript while Sarvam is still streaming
+    the audio.  When the final transcript arrives and retrieval is already
+    complete, the pipeline skips straight to guardrail + fast grounded answer,
+    saving the retrieval round-trip (~80ms P50) from the critical path.
+
+    Uses the fast grounded (local extractive) answer path by default so the
+    remote LLM (~700-1300ms) doesn't undo the overlap savings.  Set
+    LLM_PROVIDER=groq/anthropic in the environment to switch to a hosted model.
+
+    The trace in the response body includes:
+      - stt_to_first_partial_ms : time from stream open to first partial
+      - stt_final_ms            : full STT wall clock (stream open → final)
+      - retrieval_on_partial_ms : wall clock from stable partial to retrieval done
+      - stt_overlap_savings_ms  : retrieval ms that ran concurrently with STT
+      - total_ms                : ASGI entry → response flush (never adjusted)
+
+    Requires SARVAM_API_KEY; falls back to a 503 if missing.
+    """
+    trace = _request_trace(request)
+    harness = get_harness()
+    with trace.span("body_parse"):
+        audio_bytes = await audio.read()
+        trace.label("audio_bytes", len(audio_bytes))
+    result = await harness.run_overlapped(
+        audio_bytes,
+        filename=audio.filename or "audio.wav",
+        content_type=audio.content_type,
+        trace=trace,
+    )
+    trace.mark("route_end")
+    return result
+
+
+class RealtimeTextQuery(BaseModel):
+    """A pre-transcribed question for benchmarking the overlapped path."""
+
+    query: str
+
+
+@app.post("/query/realtime/text", response_model=PipelineResult)
+async def query_realtime_text(body: RealtimeTextQuery, request: Request) -> PipelineResult:
+    """
+    Benchmark-only endpoint: runs the overlapped pipeline path with a
+    MockRealtimeSTT that emits canned partial + final events for `query`,
+    so the overlap instrumentation is exercised without a live microphone
+    or SARVAM_API_KEY.
+
+    The trace includes the same overlap spans as /query/realtime, making
+    it possible to measure the post-STT pipeline latency (embedding,
+    FAISS, BM25, guardrails, fast answer) in an automated benchmark.
+    """
+    from src.stt import MockRealtimeSTT
+
+    trace = _request_trace(request)
+    harness = get_harness()
+
+    mock = MockRealtimeSTT()
+    mock._transcripts["unknown"] = body.query
+
+    result = await harness.run_overlapped(
+        b"mock-audio",          # ignored by MockRealtimeSTT
+        filename="mock.wav",
+        trace=trace,
+        realtime_stt_client=mock,
+    )
+    trace.mark("route_end")
+    return result
+
+
 @app.post("/query/stream")
 async def query_stream(audio: UploadFile = File(...), request: Request = None) -> StreamingResponse:
     """

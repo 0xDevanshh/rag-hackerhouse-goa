@@ -1010,6 +1010,368 @@ class PipelineHarness:
         log(final_result)
         yield StreamDoneEvent(result=final_result)
 
+    # ------------------------------------------------------------------
+    # Overlapped STT + retrieval path
+    # ------------------------------------------------------------------
+
+    async def run_overlapped(
+        self,
+        audio_bytes: bytes,
+        filename: str = "audio.wav",
+        content_type: str | None = None,
+        trace: RequestTrace | None = None,
+        scope: str | None = None,
+        realtime_stt_client=None,
+    ) -> PipelineResult:
+        """
+        Lowest-achievable-latency audio path: start retrieval on the first
+        *stable* partial transcript while STT is still running, so retrieval
+        latency is hidden inside the STT round-trip instead of sitting on
+        top of it.
+
+        Critical path with this architecture::
+
+            ┌─── STT streaming ───────────────────────────┐
+            │  partial₁  partial₂  stable_partial  final  │
+            └─────────────────────────────────────────────┘
+                                   │
+                                   └── retrieval starts here (concurrent)
+                                                │
+                                                └── retrieval done
+                                                            │
+                              final transcript arrives ──── ┘
+                                                            │
+                                              guardrail + fast answer
+                                                            │
+                                                         DONE
+
+        The wall clock stops when the response is returned, and total_ms is
+        measured end-to-end from ASGI arrival (via the existing
+        LatencyTraceMiddleware) — STT time is never subtracted, hidden, or
+        excluded.  The ``stt_overlap_savings`` span records how many ms of
+        retrieval ran concurrently with STT, which is the genuine reduction
+        in total_ms this architecture achieves.
+
+        If retrieval finishes *after* the final transcript (the partial was
+        unstable or retrieval was unusually slow), the path degrades
+        gracefully: the pipeline waits for retrieval to complete and
+        proceeds normally — no answer is skipped, no result is fabricated.
+
+        Uses the fast grounded (ExtractiveProvider / local) answer path by
+        default.  The remote LLM path (700-1300ms) is categorically
+        incompatible with any sub-second target; keeping it optional via the
+        existing generator avoids hard-coding the choice here.
+
+        Args:
+            audio_bytes: raw audio file content.
+            filename: audio filename hint passed to Sarvam.
+            content_type: MIME type hint passed to Sarvam.
+            trace: in-progress RequestTrace (from ASGI middleware).
+            scope: answer-cache isolation scope override.
+            realtime_stt_client: a SarvamRealtimeSTT or MockRealtimeSTT
+                instance.  If None, one is constructed lazily from the env.
+
+        Returns:
+            PipelineResult with full latency breakdown including
+            ``stt_to_first_partial``, ``retrieval_on_partial``,
+            ``stt_final``, and ``stt_overlap_savings`` spans.
+        """
+        from src.stt import SarvamRealtimeSTT, PartialTranscriptEvent, FinalTranscriptEvent
+
+        owns_trace = trace is None
+        if trace is None:
+            trace = RequestTrace()
+            trace.start()
+        errors: list[StageError] = []
+        guard_flags: dict[str, GuardResult] = {}
+
+        def finish(result: PipelineResult) -> PipelineResult:
+            if owns_trace:
+                trace.finish()
+            logger.info("%s", trace.render())
+            return result
+
+        trace.label("input", "audio_overlapped")
+
+        # Lazy-build a realtime STT client once per harness.
+        if realtime_stt_client is None:
+            if not hasattr(self, "_realtime_stt_client") or self._realtime_stt_client is None:
+                try:
+                    self._realtime_stt_client = SarvamRealtimeSTT()
+                except Exception as exc:
+                    errors.append(StageError(stage="stt", error_type=type(exc).__name__, message=str(exc)))
+                    return finish(self._degraded(
+                        "Speech-to-text is not configured (SARVAM_API_KEY missing).",
+                        trace, guard_flags, errors,
+                    ))
+            realtime_stt_client = self._realtime_stt_client
+
+        # ── Phase 1: STT streaming + concurrent retrieval ──────────────
+
+        stt_stream_started = time.perf_counter()
+        first_partial_at: float | None = None
+        stable_partial_at: float | None = None
+        final_transcript_at: float | None = None
+        stable_partial_text: str = ""
+        final_text: str = ""
+        partial_changes: int = 0
+
+        # Retrieval future: created as soon as a stable partial arrives.
+        retrieval_task: asyncio.Task | None = None
+        retrieval_result: RetrievalResult | None = None
+        retrieval_query: str = ""  # the query retrieval ran on
+
+        async def _kick_retrieval(query: str) -> RetrievalResult | None:
+            """Fire retrieval off-event-loop and return the result."""
+            return await self._retrieve_stage(query, trace, errors)
+
+        try:
+            async for event in realtime_stt_client.stream(
+                audio_bytes, filename=filename, content_type=content_type
+            ):
+                if isinstance(event, PartialTranscriptEvent):
+                    partial_changes += 1
+                    if first_partial_at is None:
+                        first_partial_at = event.received_at
+
+                    if event.is_stable and retrieval_task is None:
+                        # First stable partial — start retrieval immediately,
+                        # don't wait for STT to finish.
+                        stable_partial_at = event.received_at
+                        stable_partial_text = normalize_query_input(event.text)
+                        retrieval_query = stable_partial_text
+                        # Ensure index is ready before spawning retrieval.
+                        if self.store.index is None or self.store.index.ntotal == 0:
+                            with trace.span("index_build"):
+                                await asyncio.to_thread(self.build_index)
+                        retrieval_task = asyncio.create_task(_kick_retrieval(retrieval_query))
+
+                elif isinstance(event, FinalTranscriptEvent):
+                    final_text = event.text
+                    final_transcript_at = event.received_at
+                    break
+
+        except Exception as exc:
+            errors.append(StageError(stage="stt", error_type=type(exc).__name__, message=str(exc)))
+            return finish(self._degraded(
+                "I couldn't understand the audio after a couple of tries. Could you type your question instead?",
+                trace, guard_flags, errors,
+            ))
+
+        if not final_text:
+            errors.append(StageError(stage="stt", error_type="EmptyTranscript", message="STT returned no text"))
+            return finish(self._degraded(
+                "I couldn't understand the audio. Could you type your question instead?",
+                trace, guard_flags, errors,
+            ))
+
+        # ── Record STT spans ────────────────────────────────────────────
+        stt_stream_end = time.perf_counter()
+
+        if first_partial_at is not None:
+            trace.add("stt_to_first_partial", (first_partial_at - stt_stream_started) * 1000)
+
+        # stt_final = total STT wall clock (stream open → final transcript).
+        trace.add("stt_final", (stt_stream_end - stt_stream_started) * 1000)
+
+        # ── Normalize and cache-check the final query ──────────────────
+        query_text = normalize_query_input(final_text)
+        query_text = normalize_query_input(query_text)
+
+        with trace.span("cache_lookup"):
+            cache_key = self._result_cache_key(query_text, scope)
+            cached = self._result_cache.get(cache_key)
+            if cached is not None:
+                self._result_cache.move_to_end(cache_key)
+        if cached is not None:
+            trace.label("cache", "hit")
+            if retrieval_task is not None:
+                retrieval_task.cancel()
+            return finish(cached.model_copy(update={"trace": trace, "cached": True}))
+        trace.label("cache", "miss")
+
+        # ── Phase 2: If the final query differs materially from the
+        #    partial we retrieved on, discard and re-retrieve. ──────────
+        queries_match = (
+            retrieval_query
+            and _queries_close_enough(query_text, retrieval_query)
+        )
+
+        if retrieval_task is not None and not queries_match:
+            # Final differed from the stable partial — cancel speculative
+            # retrieval and fall back to serial retrieval on the correct query.
+            retrieval_task.cancel()
+            try:
+                await retrieval_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            retrieval_task = None
+            trace.label("retrieval_rerun", True)
+
+        retrieval_wait_started = time.perf_counter()
+
+        if retrieval_task is not None:
+            # Await the already-running retrieval task.  If it finished during
+            # STT, this returns immediately (zero additional wait).
+            try:
+                retrieval_result = await retrieval_task
+            except Exception as exc:
+                errors.append(StageError(stage="retrieval", error_type=type(exc).__name__, message=str(exc)))
+                retrieval_result = None
+        else:
+            # No speculative retrieval ran (no stable partial, or re-run needed).
+            retrieval_result = await self._retrieve_stage(query_text, trace, errors)
+
+        retrieval_wait_end = time.perf_counter()
+
+        # ── Compute overlap savings ─────────────────────────────────────
+        if retrieval_task is not None and stable_partial_at is not None:
+            # How much of retrieval ran concurrently with STT?
+            # = final_transcript_time - stable_partial_time
+            #   (the window during which retrieval was running while STT
+            #    was still receiving audio)
+            # Capped at actual retrieval duration — can't save more than
+            # retrieval cost.
+            retrieval_span = trace.get("retrieval_overhead")  # rough proxy
+            concurrent_window_ms = (
+                (final_transcript_at - stable_partial_at) * 1000
+                if final_transcript_at is not None
+                else 0.0
+            )
+            # More precisely: how long retrieval actually ran during STT.
+            # retrieval_wait is the part that waited *after* STT finished.
+            actual_wait_ms = (retrieval_wait_end - retrieval_wait_started) * 1000
+            retrieval_duration_ms = sum(
+                trace.get(s) or 0.0
+                for s in ("embedding_cache", "embedding_compute", "vector_search",
+                          "bm25", "fusion", "reranking", "retrieval_overhead")
+            )
+            savings_ms = max(0.0, retrieval_duration_ms - actual_wait_ms)
+            if savings_ms > 0:
+                trace.add("stt_overlap_savings", savings_ms)
+            trace.label("overlap_concurrent_window_ms", int(concurrent_window_ms))
+
+        # ── Retrieval-on-partial span ──────────────────────────────────
+        # This is an *overlapping* wall-clock interval (it spans the same
+        # clock ticks as the flat retrieval sub-spans), so it must be
+        # recorded as a detail rather than a flat span.  Recording it as a
+        # span would double-count those ms and push unaccounted_ms negative.
+        if stable_partial_at is not None:
+            trace.detail(
+                "retrieval_on_partial",
+                (retrieval_wait_end - stable_partial_at) * 1000,
+            )
+
+        trace.label("partial_changes", partial_changes)
+        trace.label("queries_matched", queries_match)
+
+        if retrieval_result is None:
+            return finish(self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text))
+
+        # ── Stage 2: InputGuardrail ────────────────────────────────────
+        input_result = self._run_stage(
+            "query_preprocessing", trace, errors, self.input_guardrail.check, query_text
+        )
+        if input_result is None:
+            return finish(self._degraded(REFUSAL_RESPONSE, trace, guard_flags, errors, query_text=query_text))
+        guard_flags["input"] = input_result
+        if not input_result.allowed:
+            result = PipelineResult(
+                answer=input_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text, sources=[], trace=trace,
+                guard_flags=guard_flags, degraded=False, errors=errors,
+            )
+            self._cache_result(cache_key, result)
+            return finish(result)
+
+        # ── Stage 4: RelevanceGuardrail ────────────────────────────────
+        relevance_result = self._run_stage(
+            "relevance_guard", trace, errors, self.relevance_guardrail.check, retrieval_result
+        )
+        if relevance_result is None:
+            return finish(self._degraded(
+                REFUSAL_RESPONSE, trace, guard_flags, errors,
+                query_text=query_text,
+                sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            ))
+        guard_flags["relevance"] = relevance_result
+        if not relevance_result.allowed:
+            result = PipelineResult(
+                answer=relevance_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
+                sources=retrieval_result.chunks, scores=retrieval_result.scores,
+                trace=trace, guard_flags=guard_flags, degraded=False, errors=errors,
+            )
+            self._cache_result(cache_key, result)
+            return finish(result)
+
+        # ── Stage 5: Generation + grounding-vector prep (concurrent) ───
+        answer_text, chunk_vectors = await asyncio.gather(
+            self._generate_stage(query_text, retrieval_result, trace, errors),
+            self._chunk_vectors_for(retrieval_result),
+        )
+        if answer_text is None:
+            return finish(self._degraded(
+                "I'm having trouble generating an answer right now. Please try again shortly.",
+                trace, guard_flags, errors,
+                query_text=query_text,
+                sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            ))
+
+        # ── Stage 6: GroundingGuardrail ────────────────────────────────
+        grounding_result = self._run_stage(
+            "grounding_guard", trace, errors,
+            self.grounding_guardrail.check, answer_text,
+            retrieval_result.chunks, chunk_vectors,
+        )
+        if grounding_result is None:
+            return finish(self._degraded(
+                REFUSAL_RESPONSE, trace, guard_flags, errors,
+                query_text=query_text,
+                sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            ))
+        guard_flags["grounding"] = grounding_result
+        if not grounding_result.allowed:
+            result = PipelineResult(
+                answer=grounding_result.response_override or REFUSAL_RESPONSE,
+                query_text=query_text,
+                sources=retrieval_result.chunks, scores=retrieval_result.scores,
+                trace=trace, guard_flags=guard_flags, degraded=False, errors=errors,
+            )
+            self._cache_result(cache_key, result)
+            return finish(result)
+
+        result = PipelineResult(
+            answer=grounding_result.response_override or answer_text,
+            query_text=query_text,
+            sources=retrieval_result.chunks, scores=retrieval_result.scores,
+            trace=trace, guard_flags=guard_flags, degraded=False, errors=errors,
+        )
+        self._cache_result(cache_key, result)
+        return finish(result)
+
+
+def _queries_close_enough(a: str, b: str, threshold: float = 0.7) -> bool:
+    """
+    Heuristic: are two query strings close enough that retrieval on `b`
+    is valid for answering `a`?
+
+    Uses token overlap (Jaccard similarity on word sets).  A score >= threshold
+    means we trust the speculative retrieval result; below it we re-retrieve.
+    Simple and fast — no model needed, runs in microseconds.
+
+    threshold=0.7 means at least 70% of the token union must be shared.
+    """
+    import re
+    def tokens(s: str) -> set:
+        return set(re.findall(r"\w+", s.casefold()))
+    ta, tb = tokens(a), tokens(b)
+    if not ta and not tb:
+        return True
+    intersection = len(ta & tb)
+    union = len(ta | tb)
+    return (intersection / union) >= threshold if union else True
+
 
 DEFAULT_K_VALUES = (1, 3, 5, 10)
 

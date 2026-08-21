@@ -37,7 +37,16 @@ SPAN_ORDER: tuple[str, ...] = (
     "body_parse",
     "auth",
     "db",
+    # Serial STT (batch upload path)
     "stt_network",
+    # Overlapped STT path: partial arrives, retrieval fires concurrently,
+    # final transcript confirms.  stt_overlap_savings records the wall-clock
+    # that retrieval "got for free" by running during STT rather than after.
+    # retrieval_on_partial is a detail (not a span) because it overlaps the
+    # flat retrieval sub-spans and must not be summed into total_ms.
+    "stt_to_first_partial",
+    "stt_final",
+    "stt_overlap_savings",
     "cache_lookup",
     "query_preprocessing",
     "embedding_cache",
@@ -46,6 +55,7 @@ SPAN_ORDER: tuple[str, ...] = (
     "bm25",
     "fusion",
     "reranking",
+    "retrieval_overhead",
     "relevance_guard",
     "context_build",
     "llm_network",

@@ -348,6 +348,13 @@ table.latencyTable {
   border-top: 1px solid var(--border);
 }
 
+/* Overlap savings row: green accent to make the win visually obvious. */
+.overlapSavingsRow td {
+  color: #16a34a;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
 /* Secondary label under a stage name: what the row covers, or a sub-measurement
    (LLM time-to-first-token) that overlaps the row rather than adding to it. */
 .stageNote {
