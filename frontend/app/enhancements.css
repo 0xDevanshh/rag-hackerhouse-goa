@@ -1,0 +1,129 @@
+/* ─────────────────────────────────────────────────────────────────────────
+   VOICE RAG™ — Responsive + Enhancement Styles
+   ──────────────────────────────────────────────────────────────────────── */
+
+/* ── Hero two-column → single column on tablet/mobile ─────────────────── */
+@media (max-width: 1024px) {
+  .hero-grid {
+    grid-template-columns: 1fr !important;
+    gap: 3rem !important;
+  }
+  .hero-copy {
+    order: 1;
+  }
+  .hero-terminal {
+    order: 2;
+  }
+}
+
+/* ── Typography scale on mobile ────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .section {
+    padding: 2.5rem 0;
+  }
+
+  .hero-grid {
+    grid-template-columns: 1fr !important;
+    gap: 2rem !important;
+  }
+}
+
+/* ── SLA grid on mobile ─────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .sla-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ── Pipeline horizontal scroll on mobile ────────────────────────────── */
+.pipeline-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.pipeline-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── Evidence cards grid on mobile ─────────────────────────────────────── */
+@media (max-width: 640px) {
+  .evidence-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ── Guardrails grid on mobile ──────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .guardrail-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ── Footer grid on mobile ──────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .footer-grid {
+    grid-template-columns: 1fr !important;
+  }
+  .footer-links {
+    align-items: flex-start !important;
+    flex-direction: row !important;
+    flex-wrap: wrap !important;
+    gap: 0.75rem !important;
+  }
+}
+
+/* ── Navigation on mobile ───────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .nav-grid {
+    grid-template-columns: auto 1fr auto !important;
+    gap: 0.5rem !important;
+  }
+  .nav-center-label {
+    font-size: 0.5625rem !important;
+  }
+  .nav-brand {
+    font-size: 0.875rem !important;
+  }
+}
+
+/* ── No horizontal overflow anywhere ────────────────────────────────────── */
+* {
+  max-width: 100%;
+}
+
+img, video, canvas {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ── Smooth focus transitions ───────────────────────────────────────────── */
+button, a, input, textarea, [tabindex] {
+  transition-property: outline-offset;
+  transition-duration: var(--duration-fast);
+}
+
+/* ── Selection color ────────────────────────────────────────────────────── */
+::selection {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+/* ── Print styles ────────────────────────────────────────────────────────── */
+@media print {
+  .ticker-strip,
+  nav,
+  .mic-button,
+  .btn {
+    display: none !important;
+  }
+}
+
+/* ── High contrast mode ──────────────────────────────────────────────────── */
+@media (forced-colors: active) {
+  .status-dot {
+    outline: 1px solid ButtonText;
+  }
+  .chip {
+    outline: 1px solid ButtonText;
+  }
+}
