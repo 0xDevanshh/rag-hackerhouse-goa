@@ -1,528 +1,522 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { PipelineResult, RequestTrace } from "./types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const MOTION_MS = 200;
-const AUDIO_BUFFER_SIZE = 512;
+import Ticker from "./components/Ticker";
+import Navigation from "./components/Navigation";
+import VoiceTerminal from "./components/VoiceTerminal";
+import AnswerSection from "./components/AnswerSection";
+import EvidenceSection from "./components/EvidenceSection";
+import LatencyPanel from "./components/LatencyPanel";
+import GuardrailsSection from "./components/GuardrailsSection";
+import ArchitectureSection from "./components/ArchitectureSection";
+import ChunkingSection from "./components/ChunkingSection";
+import EvidenceTrail from "./components/EvidenceTrail";
+import QueryHistory from "./components/QueryHistory";
+import Footer from "./components/Footer";
 
-type BackendStatus = "checking" | "up" | "down";
-type UiState = "idle" | "recording" | "processing" | "result" | "error";
+import type { BackendStatus, FrontendResult, HistoryItem, UiPhase } from "./lib/types";
+import { checkHealth } from "./lib/api";
 
-/**
- * Total duration of the named spans, or null if none of them ran.
- *
- * null and 0 are deliberately different: "this stage never ran" (a cache hit
- * skips retrieval entirely) renders as "—", while "ran and cost nothing
- * measurable" renders as "0 ms".
- *
- * Defensive about the shape on purpose. This component is rendered from a
- * payload owned by a separate backend, and a renamed field previously took the
- * whole page down with an uncaught TypeError rather than degrading one table
- * cell. A missing span list should cost a dash, not the app.
- */
-function spanTotal(trace: RequestTrace | undefined, ...names: string[]): number | null {
-  const spans = trace?.spans;
-  if (!Array.isArray(spans)) return null;
-  const matched = spans.filter((s) => names.includes(s.name));
-  return matched.length ? matched.reduce((sum, s) => sum + s.duration_ms, 0) : null;
+const RAG_TARGET_MS = 200;
+const HISTORY_KEY = "vrag_history_v1";
+const MAX_HISTORY = 12;
+
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 10);
 }
 
-/** A value from the trace's overlapping aggregates (e.g. `llm_ttft`). */
-function detail(trace: RequestTrace | undefined, name: string): number | null {
-  const value = trace?.details?.[name];
-  return typeof value === "number" ? value : null;
+function loadHistory(): HistoryItem[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? (JSON.parse(raw) as HistoryItem[]) : [];
+  } catch {
+    return [];
+  }
 }
 
-/**
- * The measured wall clock, taken from the server rather than summed here — see
- * RequestTrace in ./types. Summing spans would quietly drop whatever the
- * backend didn't instrument.
- */
-function totalMs(trace: RequestTrace | undefined): number | null {
-  return typeof trace?.total_ms === "number" ? trace.total_ms : null;
+function saveHistory(items: HistoryItem[]) {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, MAX_HISTORY)));
+  } catch {}
 }
 
-function ragTotalMs(trace: RequestTrace | undefined): number | null {
-  return spanTotal(
-    trace,
-    "query_preprocessing",
-    "embedding_cache",
-    "embedding_compute",
-    "vector_search",
-    "bm25",
-    "fusion",
-    "reranking",
-    "retrieval_overhead",
-    "relevance_guard",
-    "context_build",
-    "llm_network",
-    "llm_client_wait",
-    "llm_generation",
-    "llm_retry_wait",
-    "grounding_guard",
-  );
-}
+type Theme = "light" | "dark";
 
-function formatMs(ms: number | null): string {
-  return ms === null ? "—" : `${ms.toFixed(0)} ms`;
+function getInitialTheme(): Theme {
+  try {
+    const stored = localStorage.getItem("vrag_theme");
+    if (stored === "light" || stored === "dark") return stored;
+  } catch {}
+  return typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
 }
 
 export default function Home() {
-  const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
-  const [uiState, setUiState] = useState<UiState>("idle");
-  const [result, setResult] = useState<PipelineResult | null>(null);
-  const [streamingAnswer, setStreamingAnswer] = useState("");
-  const [liveTranscript, setLiveTranscript] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [theme, setTheme] = useState<Theme>("light");
+  const [backendStatus, setBackendStatus] = useState<BackendStatus>("CHECKING");
+  const [currentResult, setCurrentResult] = useState<FrontendResult | null>(null);
+  const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [requestCount, setRequestCount] = useState(0);
+  const [isOffline, setIsOffline] = useState(false);
+  const [phase, setPhase] = useState<UiPhase>("IDLE");
 
-  const streamRef = useRef<MediaStream | null>(null);
-  const realtimeSocketRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const workletRef = useRef<AudioWorkletNode | null>(null);
-  const sttTimingRef = useRef({
-    audioAvailableMs: null as number | null,
-    firstAudioSentMs: null as number | null,
-    firstPartialReceivedMs: null as number | null,
-    firstPartialText: "",
-  });
+  const resultRef = useRef<HTMLDivElement>(null);
 
-  const sendPcmFrame = (samples: Float32Array, inputRate: number) => {
-    const now = performance.now();
-    if (sttTimingRef.current.audioAvailableMs === null) {
-      sttTimingRef.current.audioAvailableMs = now;
-    }
-    const ratio = inputRate / 16000;
-    const outputLength = Math.floor(samples.length / ratio);
-    const pcm = new Int16Array(outputLength);
-    for (let i = 0; i < outputLength; i += 1) {
-      const sample = Math.max(-1, Math.min(1, samples[Math.floor(i * ratio)]));
-      pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    }
-    let binary = "";
-    const bytes = new Uint8Array(pcm.buffer);
-    for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
-    const socket = realtimeSocketRef.current;
-    if (socket?.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({ event: "audio_input", audio: btoa(binary) }));
-      if (sttTimingRef.current.firstAudioSentMs === null) {
-        sttTimingRef.current.firstAudioSentMs = performance.now();
-      }
-    }
-  };
+  // ── Theme init ────────────────────────────────────────────────────────
+  useEffect(() => {
+    const t = getInitialTheme();
+    setTheme(t);
+    document.documentElement.setAttribute("data-theme", t);
+    setHistory(loadHistory());
+  }, []);
 
-  const finishRealtimeAudio = () => {
-    workletRef.current?.disconnect();
-    audioSourceRef.current?.disconnect();
-    audioContextRef.current?.close();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    workletRef.current = null;
-    audioSourceRef.current = null;
-    audioContextRef.current = null;
-  };
-
-  const submitTranscript = async (transcript: string) => {
-    // Route through the fast extractive path by default. The generative
-    // endpoint (/query/text) calls the remote LLM and grounding guardrail,
-    // adding 700-1300ms that is not reducible by any local optimization.
-    // /query/realtime/text uses MockRealtimeSTT + ExtractiveProvider: the
-    // same embedding/FAISS/BM25 pipeline, zero network calls, ~30-50ms.
-    const res = await fetch(`${API_URL}/query/realtime/text`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: transcript }),
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => {
+      const next: Theme = prev === "light" ? "dark" : "light";
+      document.documentElement.setAttribute("data-theme", next);
+      try { localStorage.setItem("vrag_theme", next); } catch {}
+      return next;
     });
-    if (!res.ok) throw new Error(`RAG request failed with status ${res.status}`);
-    setResult((await res.json()) as PipelineResult);
-    setUiState("result");
-  };
+  }, []);
 
-  const pingBackend = async () => {
-    try {
-      const res = await fetch(`${API_URL}/health`);
-      setBackendStatus(res.ok ? "up" : "down");
-    } catch {
-      setBackendStatus("down");
-    }
-  };
-
-  const retryBackendCheck = () => {
-    setBackendStatus("checking");
-    pingBackend();
-  };
-
+  // ── Backend health polling ────────────────────────────────────────────
   useEffect(() => {
     let ignore = false;
 
-    async function checkOnMount() {
-      try {
-        const res = await fetch(`${API_URL}/health`);
-        if (!ignore) setBackendStatus(res.ok ? "up" : "down");
-      } catch {
-        if (!ignore) setBackendStatus("down");
+    const check = async () => {
+      const ok = await checkHealth();
+      if (!ignore) {
+        setBackendStatus(ok ? "ONLINE" : "OFFLINE");
+        setIsOffline(!ok);
       }
-    }
+    };
 
-    checkOnMount();
+    check();
+    const interval = setInterval(check, 30_000);
     return () => {
       ignore = true;
+      clearInterval(interval);
     };
   }, []);
 
-  useLayoutEffect(() => {
-    const timing = sttTimingRef.current;
-    if (timing.firstPartialReceivedMs !== null && liveTranscript === timing.firstPartialText) {
-      const renderedMs = performance.now();
-      console.info("stt_first_partial_latency", {
-        capture_to_render_ms: renderedMs - (timing.audioAvailableMs ?? renderedMs),
-        capture_to_send_ms: (timing.firstAudioSentMs ?? renderedMs) - (timing.audioAvailableMs ?? renderedMs),
-        send_to_receive_ms: timing.firstPartialReceivedMs - (timing.firstAudioSentMs ?? timing.firstPartialReceivedMs),
-        receive_to_render_ms: renderedMs - timing.firstPartialReceivedMs,
-      });
-      timing.firstPartialText = "";
-    }
-  }, [liveTranscript]);
-
-  const startRecording = async () => {
-    setErrorMessage(null);
-    if (typeof AudioContext === "undefined" || typeof WebSocket === "undefined") {
-      setErrorMessage("This browser doesn't support realtime audio capture.");
-      setUiState("error");
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      setLiveTranscript("");
-      sttTimingRef.current = {
-        audioAvailableMs: null,
-        firstAudioSentMs: null,
-        firstPartialReceivedMs: null,
-        firstPartialText: "",
-      };
-      const configResponse = await fetch(`${API_URL}/stt/realtime/config`);
-      const realtimeConfig = configResponse.ok
-        ? (await configResponse.json()) as {
-            direct?: boolean;
-            url?: string;
-            protocol?: string;
-            query?: Record<string, string>;
-          }
-        : null;
-      const socketUrl = realtimeConfig?.direct && realtimeConfig.url && realtimeConfig.query
-        ? `${realtimeConfig.url}?${new URLSearchParams(realtimeConfig.query)}`
-        : `${API_URL.replace(/^http/, "ws")}/stt/realtime`;
-      const socket = realtimeConfig?.direct && realtimeConfig.protocol
-        ? new WebSocket(socketUrl, realtimeConfig.protocol)
-        : new WebSocket(socketUrl);
-      realtimeSocketRef.current = socket;
-      socket.onmessage = (event) => {
-        const message = JSON.parse(event.data) as { event?: string; text?: string };
-        if (message.event === "transcript.partial" && message.text) {
-          if (sttTimingRef.current.firstPartialReceivedMs === null) {
-            sttTimingRef.current.firstPartialReceivedMs = performance.now();
-            sttTimingRef.current.firstPartialText = message.text;
-          }
-          setLiveTranscript(message.text);
-        }
-        if (message.event === "transcript.final" && message.text) {
-          setLiveTranscript(message.text);
-          finishRealtimeAudio();
-          socket.close();
-          submitTranscript(message.text).catch((error: unknown) => {
-            setErrorMessage(error instanceof Error ? error.message : "Could not answer the transcript.");
-            setUiState("error");
-          });
-        }
-      };
-      socket.onerror = () => {
-        finishRealtimeAudio();
-        setErrorMessage("Realtime speech recognition is unavailable.");
-        setUiState("error");
-      };
-      await new Promise<void>((resolve, reject) => {
-        socket.addEventListener("open", () => resolve(), { once: true });
-        socket.addEventListener("error", () => reject(new Error("Realtime speech connection failed.")), { once: true });
-      });
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      const source = audioContext.createMediaStreamSource(stream);
-      if (!audioContext.audioWorklet) throw new Error("AudioWorklet is required for realtime capture.");
-      await audioContext.audioWorklet.addModule("/audio-capture-worklet.js");
-      const worklet = new AudioWorkletNode(audioContext, "audio-capture-processor");
-      worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
-        sendPcmFrame(event.data, audioContext.sampleRate);
-      };
-      source.connect(worklet);
-      // Keep the graph active without monitoring the microphone. The worklet
-      // emits silent output, so captured audio cannot echo through speakers.
-      worklet.connect(audioContext.destination);
-      workletRef.current = worklet;
-      audioContextRef.current = audioContext;
-      audioSourceRef.current = source;
-      requestAnimationFrame(() => {
-        setUiState("recording");
-      });
-    } catch {
-      setErrorMessage("Microphone access was denied or is unavailable.");
-      setUiState("error");
-    }
-  };
-
-  const stopRecording = () => {
-    finishRealtimeAudio();
-    realtimeSocketRef.current?.send(JSON.stringify({ event: "end" }));
-    window.setTimeout(() => {
-      setUiState("processing");
-    }, MOTION_MS);
-  };
-
-  const handleRecordClick = () => {
-    if (uiState === "recording") {
-      stopRecording();
+  // Update nav status when processing
+  useEffect(() => {
+    if (["RETRIEVING", "GROUNDING", "GENERATING", "TRANSCRIBING", "UPLOADING"].includes(phase)) {
+      setBackendStatus("PROCESSING");
+    } else if (isOffline) {
+      setBackendStatus("OFFLINE");
     } else {
-      setResult(null);
-      startRecording();
+      setBackendStatus("ONLINE");
     }
-  };
+  }, [phase, isOffline]);
 
-  const reset = () => {
-    setResult(null);
-    setStreamingAnswer("");
-    setLiveTranscript("");
-    setIsStreaming(false);
-    setErrorMessage(null);
-    setUiState("idle");
-  };
+  // ── Handle query result ───────────────────────────────────────────────
+  const handleResult = useCallback((result: FrontendResult) => {
+    setCurrentResult(result);
 
-  const backendDown = backendStatus === "down";
+    // Add to history
+    const item: HistoryItem = {
+      id: generateId(),
+      timestamp: Date.now(),
+      query: result.query,
+      mode: result.inputMode,
+      status: result.isDegraded ? "DEGRADED" : "COMPLETE",
+      totalMs: result.latency.totalMs,
+      result,
+    };
+    setHistory((prev) => {
+      const next = [item, ...prev].slice(0, MAX_HISTORY);
+      saveHistory(next);
+      return next;
+    });
+
+    // Scroll to results
+    setTimeout(() => {
+      resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 200);
+  }, []);
+
+  const handleRestore = useCallback((result: FrontendResult) => {
+    setCurrentResult(result);
+    setTimeout(() => {
+      resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 100);
+  }, []);
+
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+    try { localStorage.removeItem(HISTORY_KEY); } catch {}
+  }, []);
+
+  const resetResult = useCallback(() => {
+    setCurrentResult(null);
+  }, []);
+
+  const isDegrade = currentResult?.isDegraded ?? false;
+  const isRefused =
+    currentResult?.grounding.status === "REFUSED" ||
+    (currentResult?.answer ?? "").includes("I don't have enough information");
 
   return (
-    <div className="container">
-      <header className="header">
-        <div>
-          <h1>Voice RAG</h1>
-          <p className="subtitle">Ask a question out loud, grounded in the document corpus.</p>
-        </div>
-        <span className="statusPill">
-          <span className={`statusDot ${backendStatus === "up" ? "up" : backendStatus === "down" ? "down" : ""}`} />
-          {backendStatus === "checking" && "Checking backend…"}
-          {backendStatus === "up" && "Backend online"}
-          {backendStatus === "down" && "Backend offline"}
-        </span>
-      </header>
+    <div className="page-wrapper">
+      {/* 01 — Ticker */}
+      <Ticker />
 
-      {backendDown && (
-        <div className="backendDownBanner">
-          <strong>Backend not running.</strong>
-          <span>
-            Couldn&apos;t reach {API_URL}. Start the FastAPI server (e.g. <code>python src/api.py</code>) and try again.
-          </span>
-          <button onClick={retryBackendCheck}>Retry connection</button>
-        </div>
-      )}
+      {/* 02 — Navigation */}
+      <Navigation
+        backendStatus={backendStatus}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+      />
 
-      <div className="recorderArea">
-        <button
-          className={`recordButton ${uiState === "recording" ? "recording" : ""}`}
-          onClick={handleRecordClick}
-          disabled={backendDown || uiState === "processing"}
+      {/* Offline banner */}
+      <AnimatePresence>
+        {isOffline && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            style={{ overflow: "hidden" }}
+          >
+            <div
+              style={{
+                background: "var(--danger-bg)",
+                borderBottom: "1px solid var(--danger)",
+                padding: "0.5rem 2rem",
+                display: "flex",
+                alignItems: "center",
+                gap: "0.75rem",
+              }}
+              role="alert"
+            >
+              <span
+                style={{
+                  fontFamily: "var(--font-mono)",
+                  fontSize: "0.625rem",
+                  fontWeight: 600,
+                  letterSpacing: "0.1em",
+                  color: "var(--danger)",
+                }}
+              >
+                DEMO MODE / API OFFLINE
+              </span>
+              <span
+                style={{
+                  fontFamily: "var(--font-body)",
+                  fontSize: "0.8125rem",
+                  color: "var(--fg-secondary)",
+                }}
+              >
+                Backend unreachable. Start the FastAPI server to run live queries.
+              </span>
+              <button
+                className="btn btn-ghost"
+                onClick={async () => {
+                  setBackendStatus("CHECKING");
+                  const ok = await checkHealth();
+                  setBackendStatus(ok ? "ONLINE" : "OFFLINE");
+                  setIsOffline(!ok);
+                }}
+                style={{ marginLeft: "auto", fontSize: "0.625rem" }}
+              >
+                RETRY
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <main>
+        {/* 03 — Hero + Live voice terminal */}
+        <section
+          id="hero"
+          className="section"
+          style={{ paddingBottom: "3rem" }}
         >
-          {uiState === "recording" ? "Stop" : "Record"}
-        </button>
+          <div className="container">
+            <div
+              className="hero-grid"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: "4rem",
+                alignItems: "start",
+              }}
+            >
+              {/* LEFT — Editorial copy */}
+              <div>
+                <div className="label-accent" style={{ marginBottom: "1.25rem" }}>
+                  01 / VOICE → EVIDENCE → ANSWER
+                </div>
+                <h1
+                  style={{
+                    fontFamily: "var(--font-head)",
+                    fontWeight: 800,
+                    fontSize: "clamp(3rem, 6vw, 5.5rem)",
+                    letterSpacing: "-0.04em",
+                    lineHeight: 0.95,
+                    color: "var(--fg)",
+                    marginBottom: "1.5rem",
+                  }}
+                >
+                  VOICE-FIRST
+                  <br />
+                  <span
+                    style={{
+                      color: "var(--accent2)",
+                      fontStyle: "italic",
+                    }}
+                  >
+                    RESEARCH
+                  </span>
+                </h1>
 
-        <div className="stateLabel">
-          {uiState === "idle" && "Tap to ask a question"}
-          {uiState === "recording" && "Listening… tap to stop"}
-          {uiState === "processing" && <span className="spinner" aria-label="Processing" />}
-          {uiState === "result" && !isStreaming && "Done — tap Record to ask another question"}
-          {uiState === "result" && isStreaming && "Generating…"}
-          {uiState === "error" && "Tap Record to try again"}
-        </div>
-      </div>
+                <h2
+                  style={{
+                    fontFamily: "var(--font-head)",
+                    fontWeight: 800,
+                    fontSize: "clamp(1.5rem, 3vw, 2.25rem)",
+                    letterSpacing: "-0.03em",
+                    lineHeight: 1,
+                    color: "var(--fg)",
+                    marginBottom: "1.5rem",
+                  }}
+                >
+                  ASK.
+                  <br />
+                  RETRIEVE.
+                  <br />
+                  VERIFY.
+                </h2>
 
-      {uiState === "recording" && liveTranscript && (
-        <div className="card">
-          <h2>Live transcript</h2>
-          <p className="queryText">{liveTranscript}</p>
-        </div>
-      )}
+                <p
+                  style={{
+                    fontFamily: "var(--font-body)",
+                    fontSize: "1rem",
+                    lineHeight: 1.65,
+                    color: "var(--fg-secondary)",
+                    marginBottom: "2rem",
+                    maxWidth: "440px",
+                  }}
+                >
+                  A multilingual voice-first RAG system that retrieves evidence,
+                  checks relevance, verifies grounding, and returns answers
+                  you can inspect.
+                </p>
 
-      {uiState === "error" && errorMessage && (
-        <div className="errorBox">
-          <strong>Something went wrong.</strong>
-          <p>{errorMessage}</p>
-        </div>
-      )}
+                {/* Metadata chips */}
+                <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "2rem" }}>
+                  {["EN + HI", "VOICE ENABLED", "HYBRID RETRIEVAL", "GROUNDED OUTPUT"].map((tag) => (
+                    <span key={tag} className="chip chip-muted">{tag}</span>
+                  ))}
+                </div>
 
-      {uiState === "result" && !result && (
-        <div className="resultSection">
-          <div className="card">
-            <h2>
-              Answer
-              {isStreaming && <span className="spinner streamingSpinner" aria-label="Generating" />}
-            </h2>
-            <p className="answerText">{streamingAnswer || "…"}</p>
+                {/* Pipeline arrow diagram */}
+                <div
+                  style={{
+                    fontFamily: "var(--font-mono)",
+                    fontSize: "0.625rem",
+                    letterSpacing: "0.06em",
+                    color: "var(--fg-muted)",
+                    lineHeight: 2.2,
+                    borderLeft: "2px solid var(--border-soft)",
+                    paddingLeft: "0.875rem",
+                  }}
+                >
+                  {[
+                    { label: "AUDIO", active: false },
+                    { label: "SPEECH RECOGNITION", active: false },
+                    { label: "QUERY UNDERSTANDING", active: false },
+                    { label: "HYBRID RETRIEVAL", active: true },
+                    { label: "EVIDENCE RANKING", active: false },
+                    { label: "GROUNDING", active: true },
+                    { label: "VERIFIED ANSWER", active: false },
+                  ].map((step) => (
+                    <div
+                      key={step.label}
+                      style={{
+                        color: step.active ? "var(--accent2)" : "var(--fg-muted)",
+                        fontWeight: step.active ? 500 : 400,
+                      }}
+                    >
+                      ↓ {step.label}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* RIGHT — Voice terminal */}
+              <div>
+                <VoiceTerminal
+                  isOffline={isOffline}
+                  onResult={handleResult}
+                  onPhaseChange={setPhase}
+                  requestCount={requestCount}
+                  onRequestCountChange={setRequestCount}
+                />
+              </div>
+            </div>
           </div>
+        </section>
+
+        {/* Results area */}
+        <AnimatePresence>
+          {currentResult && (
+            <motion.div
+              ref={resultRef}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ duration: 0.3 }}
+            >
+              {/* Degraded / Refused alert */}
+              {(isDegrade || isRefused) && (
+                <section style={{ paddingBottom: "1.5rem" }}>
+                  <div className="container-narrow">
+                    <div
+                      style={{
+                        padding: "1rem 1.25rem",
+                        border: "1px solid var(--warning)",
+                        borderRadius: "2px",
+                        background: "var(--warning-bg)",
+                        display: "flex",
+                        gap: "1rem",
+                        alignItems: "flex-start",
+                        flexWrap: "wrap",
+                      }}
+                      role="alert"
+                    >
+                      <div style={{ flex: 1 }}>
+                        <div
+                          style={{
+                            fontFamily: "var(--font-mono)",
+                            fontSize: "0.625rem",
+                            fontWeight: 600,
+                            letterSpacing: "0.1em",
+                            color: "var(--warning)",
+                            marginBottom: "0.25rem",
+                          }}
+                        >
+                          {isRefused ? "INSUFFICIENT EVIDENCE" : "DEGRADED RESPONSE"}
+                        </div>
+                        <p
+                          style={{
+                            fontFamily: "var(--font-body)",
+                            fontSize: "0.875rem",
+                            color: "var(--fg-secondary)",
+                          }}
+                        >
+                          {isRefused
+                            ? "The system could not verify an answer from the available evidence. This is a successful guardrail outcome — the system correctly declined to hallucinate."
+                            : "The pipeline encountered errors and returned a degraded fallback response."}
+                        </p>
+                      </div>
+                      <div style={{ display: "flex", gap: "0.5rem", flexShrink: 0, flexWrap: "wrap" }}>
+                        <button className="btn btn-ghost" onClick={resetResult} style={{ fontSize: "0.625rem" }}>
+                          TRY ANOTHER QUERY
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {/* 05 — Verified answer */}
+              <section className="section-sm" id="answer">
+                <div className="container-narrow">
+                  <AnswerSection result={currentResult} />
+                </div>
+              </section>
+
+              {/* 06 — Retrieved evidence */}
+              <section className="section-sm" id="evidence">
+                <div className="container-narrow">
+                  <EvidenceSection
+                    evidence={currentResult.evidence}
+                    grounding={currentResult.grounding}
+                  />
+                </div>
+              </section>
+
+              {/* 07 — Latency telemetry */}
+              <section className="section-sm" id="telemetry">
+                <div className="container-narrow">
+                  <LatencyPanel
+                    latency={currentResult.latency}
+                    ragTargetMs={RAG_TARGET_MS}
+                  />
+                </div>
+              </section>
+
+              {/* 08 — Guardrails */}
+              <section className="section-sm" id="guardrails">
+                <div className="container-narrow">
+                  <GuardrailsSection guardrails={currentResult.guardrails} />
+                </div>
+              </section>
+
+              {/* Ask another */}
+              <section style={{ paddingBottom: "3rem" }}>
+                <div className="container-narrow">
+                  <hr className="divider" style={{ marginBottom: "1.5rem" }} />
+                  <button
+                    className="btn"
+                    onClick={resetResult}
+                    style={{ fontSize: "0.75rem" }}
+                    aria-label="Clear results and ask another question"
+                  >
+                    ← ASK ANOTHER QUESTION
+                  </button>
+                </div>
+              </section>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Query history */}
+        {history.length > 0 && (
+          <section style={{ paddingBottom: "2rem" }}>
+            <div className="container-narrow">
+              <QueryHistory
+                history={history}
+                onRestore={handleRestore}
+                onClear={clearHistory}
+              />
+            </div>
+          </section>
+        )}
+
+        {/* Divider */}
+        <div className="container">
+          <hr className="divider" style={{ margin: "1rem 0" }} />
         </div>
-      )}
 
-      {uiState === "result" && result && (
-        <div className="resultSection">
-          <div className="card">
-            <h2>Transcribed query</h2>
-            <p className="queryText">&ldquo;{result.query_text}&rdquo;</p>
+        {/* 29 — Evidence trail */}
+        <section className="section" id="how">
+          <div className="container">
+            <EvidenceTrail />
           </div>
+        </section>
 
-          <div className="card">
-            <h2>
-              Answer
-              {result.degraded && <span className="badge">degraded</span>}
-              {result.cached && <span className="badge cached">cached</span>}
-            </h2>
-            <p className="answerText">{result.answer}</p>
+        {/* 09 — Architecture */}
+        <section className="section" id="architecture">
+          <div className="container">
+            <ArchitectureSection />
           </div>
+        </section>
 
-          <div className="card">
-            <h2>Top passages</h2>
-            <ul className="passageList">
-              {result.sources.slice(0, 3).map((chunk, i) => (
-                <li className="passageItem" key={i}>
-                  <div className="passageScore">score: {result.scores[i] !== undefined ? result.scores[i].toFixed(3) : "—"}</div>
-                  <div className="passageText">{chunk.text}</div>
-                </li>
-              ))}
-              {result.sources.length === 0 && <li className="passageText">No passages were retrieved.</li>}
-            </ul>
+        {/* 28 — Chunking */}
+        <section className="section-sm" id="chunking">
+          <div className="container">
+            <ChunkingSection />
           </div>
+        </section>
+      </main>
 
-          <div className="card">
-            <h2>Latency breakdown</h2>
-            <table className="latencyTable">
-              <thead>
-                <tr>
-                  <th>Stage</th>
-                  <th>Duration</th>
-                </tr>
-              </thead>
-              <tbody>
-                {/* ── Serial STT path (/query) ── */}
-                {spanTotal(result.trace, "stt_network") !== null && (
-                  <tr>
-                    <td>Speech-to-text (batch)</td>
-                    <td>{formatMs(spanTotal(result.trace, "stt_network"))}</td>
-                  </tr>
-                )}
-                {/* ── Overlapped STT path (/query/realtime) ── */}
-                {spanTotal(result.trace, "stt_final") !== null && (
-                  <>
-                    <tr>
-                      <td>
-                        STT → first partial
-                        <span className="stageNote">time until first transcript.partial</span>
-                      </td>
-                      <td>{formatMs(spanTotal(result.trace, "stt_to_first_partial"))}</td>
-                    </tr>
-                    <tr>
-                      <td>
-                        STT total
-                        <span className="stageNote">stream open → transcript.final</span>
-                      </td>
-                      <td>{formatMs(spanTotal(result.trace, "stt_final"))}</td>
-                    </tr>
-                    <tr>
-                      <td>
-                        Retrieval (on stable partial)
-                        <span className="stageNote">ran concurrently with STT</span>
-                      </td>
-                      <td>{formatMs(spanTotal(result.trace, "retrieval_on_partial"))}</td>
-                    </tr>
-                    {spanTotal(result.trace, "stt_overlap_savings") !== null && (
-                      <tr className="overlapSavingsRow">
-                        <td>
-                          ⚡ Overlap savings
-                          <span className="stageNote">retrieval ms hidden inside STT</span>
-                        </td>
-                        <td>−{formatMs(spanTotal(result.trace, "stt_overlap_savings"))}</td>
-                      </tr>
-                    )}
-                  </>
-                )}
-                {/* ── Common stages ── */}
-                <tr>
-                  <td>Embedding</td>
-                  <td>{formatMs(spanTotal(result.trace, "embedding_cache", "embedding_compute"))}</td>
-                </tr>
-                {spanTotal(result.trace, "stt_final") === null && (
-                  <tr>
-                    <td>Retrieval</td>
-                    <td>{formatMs(spanTotal(result.trace, "vector_search", "bm25", "fusion", "reranking", "retrieval_overhead"))}</td>
-                  </tr>
-                )}
-                <tr>
-                  <td>BM25 lexical search</td>
-                  <td>{formatMs(spanTotal(result.trace, "bm25"))}</td>
-                </tr>
-                <tr>
-                  <td>RRF fusion</td>
-                  <td>{formatMs(spanTotal(result.trace, "fusion"))}</td>
-                </tr>
-                <tr>
-                  <td>Guardrails</td>
-                  <td>
-                    {formatMs(spanTotal(result.trace, "query_preprocessing", "relevance_guard", "grounding_guard"))}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    LLM<span className="stageNote">first token at {formatMs(detail(result.trace, "llm_ttft"))}</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      spanTotal(result.trace, "llm_network", "llm_client_wait", "llm_generation", "llm_retry_wait"),
-                    )}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    Server overhead
-                    <span className="stageNote">middleware, body parse, serialization, flush</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      spanTotal(result.trace, "middleware", "body_parse", "serialization", "response_write"),
-                    )}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    Unaccounted<span className="stageNote">wall clock no stage claimed</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      typeof result.trace?.unaccounted_ms === "number" ? result.trace.unaccounted_ms : null,
-                    )}
-                  </td>
-                </tr>
-                <tr className="latencyTotalRow">
-                  <td>Processing (excl. speech recognition)</td>
-                  <td>{formatMs(ragTotalMs(result.trace))}</td>
-                </tr>
-                <tr className="latencyTotalRow">
-                  <td>Full end-to-end total</td>
-                  <td>{formatMs(totalMs(result.trace))}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <button className="retryButton" onClick={reset}>
-            Ask another question
-          </button>
-        </div>
-      )}
+      {/* 10 — Footer */}
+      <Footer />
     </div>
   );
 }
