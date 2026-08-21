@@ -79,6 +79,11 @@ SARVAM_REALTIME_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 # indexed in both the target language and the original English (so a query in
 # either language can retrieve), falling back to the bundled demo corpus if
 # the dataset can't be loaded.
+CORPUS = os.environ.get("CORPUS", "msmarco").strip().lower()
+if CORPUS not in ("msmarco", "demo", "both"):
+    logger.warning("unknown CORPUS=%r; falling back to 'msmarco'", CORPUS)
+    CORPUS = "msmarco"
+
 CORPUS_LANGUAGE = os.environ.get("CORPUS_LANGUAGE", "hi")
 CORPUS_SPLIT = os.environ.get("CORPUS_SPLIT", "validation")
 CORPUS_LIMIT = int(os.environ.get("CORPUS_LIMIT", "500"))
@@ -125,16 +130,32 @@ def _load_msmarco_chunks() -> list:
 
 def _load_default_chunks() -> list:
     """
-    Build the chunk set the API serves: MSMARCO-XI if it's available,
-    otherwise the bundled demo corpus.
+    Build the chunk set the API serves, selected by the CORPUS env var:
 
-    The fallback keeps the backend startable with no network and no dataset
-    cache (a fresh clone, an offline demo, CI), where load_chunker_docs would
-    otherwise have to stream ~500 examples from the Hub before /query could
-    answer anything. Which corpus won is logged, since the two produce very
-    different answers and silently serving the 2-document demo corpus while
+      "msmarco" (default) — ai4bharat/MSMARCO-XI only. Real search-engine
+          queries about arbitrary topics. This is the corpus the retrieval
+          evaluation scores against, so it is the right default for measuring
+          quality — but it means an off-corpus question ("what is retrieval
+          augmented generation") is *correctly* refused by RelevanceGuardrail,
+          because the answer genuinely isn't in there.
+      "demo" — the bundled 2-document corpus only. Covers RAG and voice-
+          pipeline concepts, so questions about how this system works get real
+          answers. Too small for meaningful retrieval metrics.
+      "both" — demo documents indexed alongside MSMARCO-XI. Costs a couple of
+          extra chunks and lets the demo answer questions about itself without
+          giving up the MSMARCO corpus.
+
+    MSMARCO loading falls back to the demo corpus on failure, which keeps the
+    backend startable with no network and no dataset cache (a fresh clone, an
+    offline demo, CI). Which corpus actually won is logged either way: the two
+    produce very different answers, and silently serving 2 documents while
     believing MSMARCO-XI is loaded would be badly misleading.
     """
+    if CORPUS == "demo":
+        chunks = _load_sample_chunks()
+        logger.info("serving the bundled demo corpus only (%d chunks, CORPUS=demo)", len(chunks))
+        return chunks
+
     try:
         chunks = _load_msmarco_chunks()
     except Exception as exc:
@@ -145,6 +166,11 @@ def _load_default_chunks() -> list:
             DEFAULT_CORPUS_PATH,
         )
         return _load_sample_chunks()
+
+    if CORPUS == "both":
+        demo_chunks = _load_sample_chunks()
+        chunks = chunks + demo_chunks
+        logger.info("added %d demo chunks alongside MSMARCO-XI (CORPUS=both)", len(demo_chunks))
 
     languages = sorted({chunk.metadata.get("language") for chunk in chunks})
     logger.info(
@@ -209,7 +235,10 @@ async def lifespan(app: FastAPI):
         # restarted) — startup itself must still succeed either way.
         yield
         return
-    harness.store.build(harness.chunks)
+    # Via the harness, not store.build() directly, so the index version the
+    # answer cache keys on actually reflects this build — see
+    # PipelineHarness.build_index.
+    await asyncio.to_thread(harness.build_index)
     await harness.prewarm()
     yield
 

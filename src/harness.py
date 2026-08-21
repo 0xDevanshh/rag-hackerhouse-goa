@@ -249,6 +249,40 @@ class PipelineHarness:
             text_fingerprint(query_text),
         )
 
+    def build_index(self, chunks: list[Chunk] | None = None) -> int:
+        """
+        Index `chunks` (defaulting to self.chunks) and return the new index
+        version.
+
+        The single place indexing happens, so the version counter cannot be
+        bypassed. It previously could: startup called `harness.store.build()`
+        directly, which skipped the counter entirely, so the answer cache key
+        claimed index_version=0 while a fully built index sat behind it. That
+        was harmless only because a fresh process starts with an empty cache —
+        any runtime re-index would have kept serving answers from the previous
+        corpus.
+
+        Both the vector index and the lexical (BM25) index are rebuilt
+        together; leaving one stale would make hybrid retrieval score a query
+        against two different corpora.
+
+        Args:
+            chunks: chunks to index. Defaults to the harness's own `chunks`.
+
+        Returns:
+            int: the incremented index version now embedded in cache keys.
+        """
+        to_index = chunks if chunks is not None else self.chunks
+        if not to_index:
+            raise RuntimeError("VectorStore is empty and no chunks were provided to index")
+        if chunks is not None:
+            self.chunks = list(chunks)
+        self.store.build(to_index)
+        self.retriever.prepare_index()
+        self._index_version += 1
+        logger.info("indexed %d chunks (index_version=%d)", len(to_index), self._index_version)
+        return self._index_version
+
     async def prewarm(self) -> dict[str, float]:
         """
         Pay every one-time initialization cost at process startup instead of
@@ -378,11 +412,7 @@ class PipelineHarness:
         try:
             if self.store.index is None or self.store.index.ntotal == 0:
                 with trace.span("index_build"):
-                    if not self.chunks:
-                        raise RuntimeError("VectorStore is empty and no chunks were provided to index")
-                    await asyncio.to_thread(self.store.build, self.chunks)
-                    await asyncio.to_thread(self.retriever.prepare_index)
-                    self._index_version += 1
+                    await asyncio.to_thread(self.build_index)
 
             started = time.perf_counter()
             try:
@@ -702,9 +732,15 @@ class PipelineHarness:
             self._cache_result(cache_key, result)
             return finish(result)
 
-        # Final response
+        # Final response.
+        #
+        # When GroundingGuardrail allows the answer but sets a
+        # response_override, it has dropped individual ungrounded sentences and
+        # the override is the surviving text — so the override must win here,
+        # not just on the refusal branch above. Returning answer_text would
+        # hand back the sentences the guardrail just rejected.
         result = PipelineResult(
-            answer=answer_text,
+            answer=grounding_result.response_override or answer_text,
             query_text=query_text,
             sources=retrieval_result.chunks,
             scores=retrieval_result.scores,

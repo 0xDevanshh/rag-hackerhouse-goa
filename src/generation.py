@@ -20,6 +20,7 @@ import groq
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from src.chunking import Chunk
+from src.text import NO_CONTEXT_RESPONSE as _NO_CONTEXT_RESPONSE
 
 logger = logging.getLogger(__name__)
 
@@ -54,23 +55,29 @@ DEFAULT_ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
 
 # Raised from 300, because the default provider is a *reasoning* model and its
 # hidden reasoning is billed against this same budget — so a cap sized for the
-# visible answer can be consumed before any answer is emitted. In a 20-query
-# warm run at 300, six requests produced zero content tokens; the grounding
-# guardrail correctly turned those into refusals, but a refusal caused by a
-# starved token budget is a wrong answer, not a safe one.
+# visible answer can be consumed before any answer is emitted, and the request
+# then reaches the user as "I don't have enough information" for a question
+# whose answer was in the retrieved context. That is a wrong answer, not a safe
+# one. At 300 tokens, six of twenty warm queries produced zero content; at 700,
+# it still happened intermittently.
 #
-# This costs almost nothing in latency, which is the reason it is safe to raise:
-# generation is a small slice of this pipeline's LLM time compared to
-# time-to-first-token, and a model that finishes early still stops early
-# (`finish_reason: stop`) rather than generating to the cap. Measured mean
-# total across the same six queries: 658ms at 300, 816ms at 700, 747ms at 1200
-# — differences inside run-to-run noise.
+# Raising it is nearly free, which is why this is the right lever: the model
+# stops when it is done (`finish_reason: stop`) rather than generating to the
+# cap, and generation is a small slice of LLM time next to time-to-first-token.
+# Measured total for the same query at 700 / 1500 / 3000 tokens: 884ms / 1138ms
+# / 808ms — no trend, all inside run-to-run noise.
 #
-# `llm_finish_reason` is recorded on the trace so a truncation
-# (`finish_reason: length`) is visible rather than inferred.
-DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "700"))
+# The cap is a backstop rather than the whole fix: a truncated empty answer is
+# intermittent, so LLMProvider.answer_streamed retries it with a larger budget,
+# and `llm_finish_reason` is recorded on the trace so the case is visible
+# instead of inferred.
+DEFAULT_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "2000"))
 
-NO_CONTEXT_RESPONSE = "I don't have enough information in the provided context to answer that."
+# Imported from src.text rather than defined here, so guardrails.py can
+# recognise a model declination without importing this module (and its
+# provider SDKs). Re-exported under the original name because SYSTEM_PROMPT
+# below interpolates it and existing callers reference generation.NO_CONTEXT_RESPONSE.
+NO_CONTEXT_RESPONSE = _NO_CONTEXT_RESPONSE
 
 SYSTEM_PROMPT = f"""You are a question-answering assistant for a retrieval-augmented system.
 
@@ -190,6 +197,7 @@ class LLMProvider(ABC):
         query: str,
         retrieved_chunks: list[tuple[Chunk, float]],
         timing: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         """Stream grounded answer deltas."""
         raise NotImplementedError
@@ -201,20 +209,73 @@ class LLMProvider(ABC):
         timing: dict[str, Any] | None = None,
         max_attempts: int = 3,
     ) -> str:
-        """Collect a bounded number of streaming attempts into one answer."""
+        """
+        Collect a bounded number of streaming attempts into one answer.
+
+        Two distinct retry conditions, for different reasons:
+
+        1. The attempt raised — transport error, rate limit. Retried with
+           exponential backoff.
+        2. The attempt succeeded but produced *no text* and stopped because it
+           hit the token cap (`finish_reason: "length"`). This is the reasoning
+           model's failure mode: hidden reasoning is billed against the same
+           budget as the answer, so on a query it finds hard it can spend the
+           whole cap thinking and emit nothing. Retried with a tripled budget.
+
+        Case 2 has to be a retry rather than a pass-through, because an empty
+        answer does not reach the user as an error — GroundingGuardrail sees
+        no sentences, refuses, and the user is told "I don't have enough
+        information in the dataset", having asked a question whose answer was
+        sitting in the retrieved context all along. A wrong answer, not a safe
+        one. It is intermittent (the same query and context can succeed on the
+        next attempt at the same budget), which is exactly what a retry is for.
+        """
         import asyncio
 
+        call_started = time.perf_counter()
         last_error: Exception | None = None
+        budget: int | None = None  # None = the provider's configured default
+        attempts = 0
+
+        def account() -> None:
+            """
+            Attribute this call's wall clock that the last attempt's own
+            timings don't cover — failed attempts and backoff sleeps — so
+            retry cost lands in a named span instead of the request-level
+            residual.
+            """
+            if timing is None:
+                return
+            timing["llm_attempts"] = attempts
+            overhead = (time.perf_counter() - call_started) * 1000 - timing.get("llm_total_ms", 0.0)
+            if overhead > 0:
+                timing["llm_retry_wait_ms"] = overhead
+
         for attempt in range(max_attempts):
+            attempts = attempt + 1
             deltas: list[str] = []
             try:
-                async for delta in self.stream_answer(query, retrieved_chunks, timing=timing):
+                async for delta in self.stream_answer(
+                    query, retrieved_chunks, timing=timing, max_tokens=budget
+                ):
                     deltas.append(delta)
-                return "".join(deltas).strip()
+                text = "".join(deltas).strip()
+                truncated = timing is not None and timing.get("llm_finish_reason") == "length"
+                if not text and truncated and attempt + 1 < max_attempts:
+                    budget = (budget or getattr(self, "max_tokens", DEFAULT_MAX_TOKENS)) * 3
+                    logger.warning(
+                        "generation produced no text and hit the token cap; "
+                        "retrying with max_tokens=%d",
+                        budget,
+                    )
+                    continue
+                account()
+                return text
             except Exception as exc:
                 last_error = exc
                 if attempt + 1 < max_attempts:
                     await asyncio.sleep(min(2**attempt, 10))
+        account()
         raise GenerationError(f"generation failed after {max_attempts} attempts: {last_error}") from last_error
 
 
@@ -255,6 +316,7 @@ class ExtractiveProvider(LLMProvider):
         query: str,
         retrieved_chunks: list[tuple[Chunk, float]],
         timing: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         started = time.perf_counter()
         answer = await self.answer(query, retrieved_chunks)
@@ -316,6 +378,7 @@ class GroqProvider(LLMProvider):
         query: str,
         retrieved_chunks: list[tuple[Chunk, float]],
         timing: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         user_message = _build_user_message(query, retrieved_chunks)
         request_started = time.perf_counter()
@@ -325,7 +388,7 @@ class GroqProvider(LLMProvider):
         try:
             stream = await self.client.chat.completions.create(
                 model=self.model,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens or self.max_tokens,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
@@ -409,6 +472,7 @@ class AnthropicProvider(LLMProvider):
         query: str,
         retrieved_chunks: list[tuple[Chunk, float]],
         timing: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         user_message = _build_user_message(query, retrieved_chunks)
         request_started = time.perf_counter()
@@ -417,7 +481,7 @@ class AnthropicProvider(LLMProvider):
         try:
             async with self.client.messages.stream(
                 model=self.model,
-                max_tokens=self.max_tokens,
+                max_tokens=max_tokens or self.max_tokens,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": user_message}],
             ) as stream:
@@ -515,6 +579,7 @@ class Generator:
         query: str,
         retrieved_chunks: list[tuple[Chunk, float]],
         timing: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[str]:
         """
         Stream an answer to query, grounded strictly in retrieved_chunks.
@@ -533,4 +598,6 @@ class Generator:
             GenerationError: if the underlying provider fails before or
             during streaming (no retry — see LLMProvider.stream_answer).
         """
-        return self.provider.stream_answer(query, retrieved_chunks, timing=timing)
+        return self.provider.stream_answer(
+            query, retrieved_chunks, timing=timing, max_tokens=max_tokens
+        )
