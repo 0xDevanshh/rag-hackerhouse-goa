@@ -211,35 +211,38 @@ def get_harness() -> PipelineHarness:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Eagerly build the harness, index its corpus, and pay every cold-start
-    cost at process startup rather than inside whichever request happens to
-    arrive first.
+    Keep startup resilient in constrained deployments while still attempting the
+    one-time warmup work that improves first-request latency.
 
-    The index build was already done here. What's added is
-    PipelineHarness.prewarm(), which covers the three costs that a live
-    request was still absorbing:
-
-      - the embedding model's lazy initialization: ~690ms on the very first
-        encode of a process, plus a fresh per-shape cost on MPS
-      - the LLM provider's DNS + TCP + TLS handshake: ~80ms to api.groq.com
-      - the STT provider's handshake: ~100ms to api.sarvam.ai
-
-    A one-time cost belongs at startup, not inside a live request's budget.
+    In production we must never let a cold-start bootstrap failure take the
+    whole service down: a missing token, slow Hugging Face fetch, or a slow
+    corpus build should log a warning and keep /health alive. The first real
+    request can still build the missing pieces lazily.
     """
     try:
         harness = get_harness()
     except HTTPException:
         # No LLM key configured yet: get_harness() already recorded
         # _harness_init_error, so /query will return a clear 503 on first
-        # use. Nothing to warm up until that's fixed (and the process
-        # restarted) — startup itself must still succeed either way.
+        # use. Nothing to warm up until that's fixed and the process is
+        # restarted — startup itself must still succeed either way.
         yield
         return
-    # Via the harness, not store.build() directly, so the index version the
-    # answer cache keys on actually reflects this build — see
-    # PipelineHarness.build_index.
-    await asyncio.to_thread(harness.build_index)
-    await harness.prewarm()
+
+    startup_timeout = float(os.environ.get("STARTUP_TIMEOUT_SECONDS", "60"))
+    try:
+        # Via the harness, not store.build() directly, so the index version the
+        # answer cache keys on actually reflects this build. Keep it bounded:
+        # a heavy first-run index build must never keep the app from coming up.
+        await asyncio.wait_for(asyncio.to_thread(harness.build_index), timeout=startup_timeout)
+    except Exception as exc:
+        logger.warning("startup index build skipped (%s: %s); app will continue with lazy initialization", type(exc).__name__, exc)
+
+    try:
+        await asyncio.wait_for(harness.prewarm(), timeout=min(startup_timeout, 30.0))
+    except Exception as exc:
+        logger.warning("startup prewarm skipped (%s: %s); app will continue with lazy warmup", type(exc).__name__, exc)
+
     yield
 
 
