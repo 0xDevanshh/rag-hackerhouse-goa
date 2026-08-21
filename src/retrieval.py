@@ -17,13 +17,29 @@ from pydantic import BaseModel
 from src.chunking import Chunk
 from src.vectorstore import VectorStore
 
-# 10 candidates is plenty for a fusion rerank that only adds small metadata
-# boosts (+0.1/+0.05) on top of cosine score — a candidate ranked much below
-# 10th place on raw similarity is vanishingly unlikely to be promoted into
-# the top_n by those boosts alone. Lower this pool size = less rerank work
-# and a smaller FAISS fetch, at negligible recall risk for this scoring model.
-RERANK_POOL_SIZE = 10
-TOP_N = 5
+# Sized from measured recall against MSMARCO-XI's own is_selected labels, over
+# the 248 of 500 cached records that actually carry one (the other 252 have no
+# labelled passage at all, so they can neither hit nor miss — scoring them
+# would just halve every number). Hindi and English form of each query, 120
+# queries:
+#
+#   hit@1  21.7%   hit@3  43.3%   hit@5  60.8%
+#   hit@10 76.7%   hit@20 77.5%   hit@50 88.3%
+#
+# top_n=5 left 39% of answerable queries without their labelled passage in
+# context, which is the difference between an answer that addresses the
+# question and one merely grounded in whatever came back. Going to 10 buys
+# +16 points; 20 buys almost nothing more (+0.8), so 10 is where the curve
+# flattens.
+#
+# The pool has to be comfortably wider than top_n for the rerank to have
+# anything to reorder, and a wider FAISS fetch is close to free — measured
+# vector_search p50 ~1ms against 9990 vectors. The cost that does scale is
+# downstream: more chunks means a larger generation prompt, so a deployment on
+# a hosted model may want top_n back at 5 to hold prompt size down. The local
+# extractive provider has no such pressure.
+RERANK_POOL_SIZE = 30
+TOP_N = 10
 IS_SELECTED_BOOST = 0.0
 LANGUAGE_MATCH_BOOST = 0.05
 LOW_CONFIDENCE_THRESHOLD = 0.3

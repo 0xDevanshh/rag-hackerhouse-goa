@@ -273,6 +273,45 @@ middleware, multipart parsing, serialization, and flush are all inside the numbe
   22ms after a 7s gap**. Neither is wrong; they bound different traffic shapes. The report measures
   embedding under both conditions rather than picking the flattering one.
 
+### Meeting a sub-200ms end-to-end budget
+
+A **remote LLM cannot meet a 200ms end-to-end budget**, and no amount of local optimization changes that.
+Measured time-to-first-token on the fastest reachable hosted model is 450–680ms — the budget is gone
+before a single token arrives. That is a property of the provider, not of this code.
+
+What does meet it is `LLM_PROVIDER=local` (`ExtractiveProvider`): a zero-network answerer that selects the
+best-supported sentences from the retrieved passages and cites them. Measured through the real ASGI stack,
+20 warm uncached queries drawn from the served corpus:
+
+| path | p50 | p95 | p99 | max | over 200ms |
+|---|---|---|---|---|---|
+| uncached, `LLM_PROVIDER=local` | **28.0 ms** | 41.7 ms | 50.2 ms | 52.3 ms | 0/20 |
+| cached | 0.2 ms | 0.3 ms | — | — | 0/20 |
+| uncached, `LLM_PROVIDER=groq` | 802 ms | 1238 ms | 1368 ms | — | 20/20 |
+
+Over 120 queries taken across `hi_validation_500.jsonl`, the local path answered **119/120 (99%)** with
+`total_ms` p50 14.8 / p95 29.6 / max 36.2, and **0 requests over 200ms**. The single failure is one record
+whose Hindi query field is corrupt — the machine translation of "suit definition" degenerated into the same
+clause repeated ~200 times, and `InputGuardrail` correctly rejects it as repetitive. Its English form
+answers normally.
+
+**The tradeoff is answer style, and it is real.** The local provider *extracts*; it does not *synthesize*.
+
+- Best case it is indistinguishable from the gold answer: "what is a corporation?" returns *"A corporation
+  is a company or group of people authorized to act as a single entity (legally a person) and recognized as
+  such in law. [passage_id: 5]"* — verbatim the dataset's own answer.
+- Worse case it leads with an off-target sentence from the right passage: the Hindi form of the same
+  question opens on a sentence about McDonald's Corporation before giving the correct definition, because
+  sentence choice is query-term overlap rather than comprehension.
+- It reads as quoted passage text, not fluent prose, and inherits the passage's punctuation.
+
+So: `local` for the latency target, `groq` for fluency. Retrieval accuracy bounds both — see the hit-rate
+figures in `src/retrieval.py`; roughly one answerable query in four does not have its labelled passage in
+context even at `top_n=10`.
+
+`bm25_ms` (p50 16.9, p95 29.3) is now the single largest stage on the local path — about 60% of the budget.
+It is the obvious next target if more headroom is wanted; nothing here needed it to hit 200ms.
+
 ### Latency-relevant configuration
 
 | Variable | Default | Why |
@@ -282,6 +321,7 @@ middleware, multipart parsing, serialization, and flush are all inside the numbe
 | `GROQ_MODEL` | `openai/gpt-oss-20b` | The previous default `llama-3.1-8b-instant` is decommissioned (404). |
 | `TRACE_BUFFER_SIZE` | `0` (off) | Ring buffer of completed traces at `GET /metrics/traces`, including the post-handler spans a response body cannot report about itself. |
 | `LLM_MAX_TOKENS` | `2000` | The default provider is a *reasoning* model whose hidden reasoning is billed against this budget; too low a cap is spent thinking and emits no answer at all. Latency-neutral (the model stops when done). |
+| `LLM_PROVIDER` | auto (`groq` if a key is set, else `local`) | `local` is the only setting that meets a sub-200ms end-to-end budget — see above. `groq`/`anthropic` synthesize more fluent answers at ~800ms+. |
 
 ### Which corpus is served (`CORPUS`)
 

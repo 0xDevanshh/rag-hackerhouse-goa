@@ -548,9 +548,10 @@ class MockRealtimeSTT(SarvamRealtimeSTT):
         self._default = default_transcript
         self._partial_chunk_words = partial_chunk_words
 
-    def prewarm(self) -> float:  # type: ignore[override]
-        return 0.0
-
+    # Async only, matching the realtime client this stands in for. A second
+    # sync definition above it was silently shadowed by this one, so callers
+    # branching on iscoroutinefunction saw whichever Python happened to bind
+    # last.
     async def prewarm(self) -> float:  # type: ignore[override]
         return 0.0
 

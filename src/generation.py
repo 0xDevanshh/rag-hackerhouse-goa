@@ -290,7 +290,14 @@ class ExtractiveProvider(LLMProvider):
         query_terms = set(re.findall(r"\w+", query.casefold()))
         selected: list[str] = []
         seen: set[str] = set()
-        for chunk, score in retrieved_chunks[:5]:
+        # Every chunk the retriever returned, not a hard-coded first five.
+        # Retriever.TOP_N is where that cutoff belongs, and it is now 10
+        # because the labelled passage is in the top 10 for 76.7% of
+        # answerable queries versus 60.8% for the top 5 — a cap here would
+        # silently discard exactly the passages that widening retrieval was
+        # meant to surface. Sentence selection below is scored on query-term
+        # overlap, so extra chunks add candidates rather than noise.
+        for chunk, score in retrieved_chunks:
             passage_id = chunk.metadata.get("passage_id", chunk.metadata.get("doc_id", "unknown"))
             for sentence in re.split(r"(?<=[.!?।])\s+", " ".join(chunk.text.split())):
                 sentence = sentence.strip()

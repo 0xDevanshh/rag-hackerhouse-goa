@@ -90,6 +90,21 @@ def _strip_citations(sentences: list[str]) -> list[str]:
     return stripped
 
 
+def _similarity_matrix(sentence_vectors: np.ndarray, chunk_vectors: np.ndarray) -> np.ndarray:
+    """
+    Full (sentences x references) cosine matrix. Both operand sets are
+    row-normalized first, so the product is cosine rather than raw dot.
+    """
+    if sentence_vectors.size == 0 or chunk_vectors.size == 0:
+        return np.zeros((len(sentence_vectors), 0), dtype=np.float32)
+
+    def unit(matrix: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        return matrix / np.where(norms == 0, 1.0, norms)
+
+    return unit(sentence_vectors) @ unit(chunk_vectors).T
+
+
 def _max_similarities(sentence_vectors: np.ndarray, chunk_vectors: np.ndarray) -> np.ndarray:
     """
     For each sentence vector, its greatest cosine similarity to any chunk
@@ -294,25 +309,52 @@ class GroundingGuardrail:
         rejected, a comfortably-grounded answer still costs zero extra
         embedding work.
         """
-        similarities = _max_similarities(self.embedder.encode(sentences, timing=timing), chunk_vectors)
+        sentence_vectors = self.embedder.encode(sentences, timing=timing)
+        matrix = _similarity_matrix(sentence_vectors, chunk_vectors)
+        if matrix.size == 0:
+            return np.zeros(len(sentences), dtype=np.float32)
+        similarities = matrix.max(axis=1)
 
         weak = [i for i, score in enumerate(similarities) if score < self.grounding_threshold]
         if not weak:
             return similarities
 
-        chunk_sentences = [
-            sentence for chunk in retrieved_chunks for sentence in _split_sentences(chunk.text)
-        ]
-        # Only worth a second pass if the chunks actually decompose into more
-        # than what pass 1 already compared against.
-        if len(chunk_sentences) <= len(retrieved_chunks):
+        # Decompose only the single best-matching chunk per weak sentence,
+        # rather than every retrieved chunk.
+        #
+        # This is the difference between a bounded and an unbounded second
+        # pass. Splitting all of them meant embedding 40-60 sentences once
+        # top_n rose to 10, which on one CPU intra-op thread measured
+        # grounding_guard at p95 149ms and max 495ms — single-handedly pushing
+        # requests past the 200ms budget while every other stage stayed in
+        # single digits. Restricting it to the passage a sentence most
+        # resembles is also the right question to ask: pass 1 already
+        # identified which chunk that is, and a sentence grounded anywhere is
+        # grounded in *that* passage, not in an unrelated one that happens to
+        # share a phrase.
+        best_chunk = matrix.argmax(axis=1)
+        wanted = sorted({int(best_chunk[i]) for i in weak})
+        per_chunk: dict[int, tuple[int, int]] = {}
+        chunk_sentences: list[str] = []
+        for position in wanted:
+            if position >= len(retrieved_chunks):
+                continue
+            pieces = _split_sentences(retrieved_chunks[position].text)
+            if len(pieces) <= 1:
+                continue  # nothing finer-grained than what pass 1 already used
+            per_chunk[position] = (len(chunk_sentences), len(chunk_sentences) + len(pieces))
+            chunk_sentences.extend(pieces)
+        if not chunk_sentences:
             return similarities
 
         chunk_sentence_vectors = self.embedder.encode(chunk_sentences, timing=timing)
-        weak_vectors = self.embedder.encode([sentences[i] for i in weak], timing=timing)
-        rescored = _max_similarities(weak_vectors, chunk_sentence_vectors)
-        for index, score in zip(weak, rescored):
-            similarities[index] = max(similarities[index], score)
+        rescored = _similarity_matrix(sentence_vectors[weak], chunk_sentence_vectors)
+        for row, index in enumerate(weak):
+            span = per_chunk.get(int(best_chunk[index]))
+            if span is None:
+                continue
+            start, end = span
+            similarities[index] = max(similarities[index], float(rescored[row, start:end].max()))
         return similarities
 
     def check(
@@ -378,9 +420,21 @@ class GroundingGuardrail:
         # Both require that the answer contains at least one [passage_id: X]
         # citation, which is the structural marker that the text was produced
         # by the extractive (not generative) path.
-        cited_evidence = re.sub(r"\s*\[passage_id:\s*[^\]]+\]", "", answer_text).strip()
-        if re.search(r"\[passage_id:\s*[^\]]+\]", answer_text) and cited_evidence:
-            evidence_sentences = _split_sentences(cited_evidence)
+        cited_evidence = _CITATION_RE.sub("", answer_text).strip()
+        if _CITATION_RE.search(answer_text) and cited_evidence:
+            # Segment on the citation markers, not on sentence boundaries.
+            #
+            # Each citation terminates exactly one piece of quoted evidence, so
+            # it is the structural boundary here. Stripping the citations first
+            # and *then* splitting on sentence punctuation could weld two
+            # quotes into one: ExtractiveProvider's splitter does not guarantee
+            # a trailing terminator, so "...no terminator [passage_id: 3] Next
+            # sentence." collapsed into a single "sentence" spanning two
+            # different passages — which no individual chunk contains, so a
+            # verbatim answer fell through to the embedding path and paid
+            # 150-500ms for a similarity check on text already known to be
+            # quoted.
+            evidence_sentences = [seg.strip() for seg in _CITATION_RE.split(answer_text) if seg.strip()]
             if evidence_sentences:
                 def _sentence_in_chunks(sent: str) -> bool:
                     sent_norm = " ".join(sent.split())
