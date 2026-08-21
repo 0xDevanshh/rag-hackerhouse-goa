@@ -3,10 +3,9 @@
 
 import type { PipelineResult } from "./types";
 
-export const API_URL =
-  typeof process !== "undefined"
-    ? (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000")
-    : "http://localhost:8000";
+export const API_URL = (
+  (typeof process !== "undefined" ? process.env.NEXT_PUBLIC_API_URL : "") || "http://localhost:8000"
+).replace(/\/+$/, "");
 
 // ── Health / readiness ────────────────────────────────────────────────────
 
@@ -19,14 +18,14 @@ export async function checkHealth(signal?: AbortSignal): Promise<boolean> {
   }
 }
 
-// ── Text query — fast extractive path ─────────────────────────────────────
-// POST /query/realtime/text — MockRealtimeSTT + ExtractiveProvider, ~30-50ms
+// ── Text query — backend contract ─────────────────────────────────────────
+// POST /query/text — already-transcribed text -> RAG pipeline
 
 export async function queryText(
   query: string,
   signal?: AbortSignal,
 ): Promise<PipelineResult> {
-  const res = await fetch(`${API_URL}/query/realtime/text`, {
+  const res = await fetch(`${API_URL}/query/text`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query }),
@@ -39,14 +38,14 @@ export async function queryText(
   return res.json() as Promise<PipelineResult>;
 }
 
-// ── Text query — LLM path ─────────────────────────────────────────────────
-// POST /query/text/llm — hosted Groq/Anthropic, ~700-1300ms
-
+// Kept for compatibility with existing imports, but it uses the same real
+// backend contract as the voice flow: the transcript is already text by the
+// time this function fires.
 export async function queryTextLlm(
   query: string,
   signal?: AbortSignal,
 ): Promise<PipelineResult> {
-  const res = await fetch(`${API_URL}/query/text/llm`, {
+  const res = await fetch(`${API_URL}/query/text`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query }),
