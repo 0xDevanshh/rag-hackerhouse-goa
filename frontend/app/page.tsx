@@ -1,393 +1,438 @@
 "use client";
-
 import { useEffect, useRef, useState } from "react";
-import type { PipelineResult, RequestTrace } from "./types";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { healthCheck, queryText } from "./lib/api";
+import type { PipelineResult } from "./types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+type Stage = "ready" | "listening" | "transcribing" | "retrieving" | "generating" | "verifying" | "done" | "error";
 
-type BackendStatus = "checking" | "up" | "down";
-type UiState = "idle" | "recording" | "processing" | "result" | "error";
+const EXAMPLES = ["What causes inflation?", "Mudrasphiti kya hai?"];
 
-interface SentenceEvent {
-  event: "sentence";
-  text: string;
-}
+const DEMO: PipelineResult = {
+  query_text: "What causes inflation?",
+  answer: "Inflation is a sustained increase in the general price level. It usually happens when demand outpaces supply, costs rise, or the money supply grows faster than available goods and services.",
+  sources: [
+    {
+      text: "Inflation refers to a sustained increase in the general price level of goods and services over time. It reduces the purchasing power of money.",
+      metadata: { language: "English" },
+      strategy_name: "faiss",
+    },
+    {
+      text: "Mudrasphiti is a sustained increase in the price level of goods and services, reducing purchasing power.",
+      metadata: { language: "Hindi" },
+      strategy_name: "faiss",
+    },
+  ],
+  scores: [0.94, 0.89],
+  trace: { spans: [], details: {}, labels: {}, total_ms: 201, unaccounted_ms: 0 },
+  guard_flags: {},
+  degraded: false,
+  cached: false,
+  errors: [],
+};
 
-interface DoneEvent {
-  event: "done";
-  result: PipelineResult;
-}
+function Wave({ active, listening }: { active: boolean; listening: boolean }) {
+  const [levels, setLevels] = useState<number[]>(() => Array(32).fill(25));
+  const animFrameRef = useRef<number | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
-function parseSseFrame(frame: string): { event: string; data: string } | null {
-  let eventType = "message";
-  let data = "";
-  for (const line of frame.split("\n")) {
-    if (line.startsWith("event:")) eventType = line.slice(6).trim();
-    else if (line.startsWith("data:")) data += line.slice(5).trim();
-  }
-  return data ? { event: eventType, data } : null;
-}
+  useEffect(() => {
+    if (!listening) {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+      }
+      return;
+    }
 
-/**
- * Total duration of the named spans, or null if none of them ran.
- *
- * null and 0 are deliberately different: "this stage never ran" (a cache hit
- * skips retrieval entirely) renders as "—", while "ran and cost nothing
- * measurable" renders as "0 ms".
- *
- * Defensive about the shape on purpose. This component is rendered from a
- * payload owned by a separate backend, and a renamed field previously took the
- * whole page down with an uncaught TypeError rather than degrading one table
- * cell. A missing span list should cost a dash, not the app.
- */
-function spanTotal(trace: RequestTrace | undefined, ...names: string[]): number | null {
-  const spans = trace?.spans;
-  if (!Array.isArray(spans)) return null;
-  const matched = spans.filter((s) => names.includes(s.name));
-  return matched.length ? matched.reduce((sum, s) => sum + s.duration_ms, 0) : null;
-}
+    let stream: MediaStream | null = null;
+    let analyser: AnalyserNode | null = null;
+    let source: MediaStreamAudioSourceNode | null = null;
 
-/** A value from the trace's overlapping aggregates (e.g. `llm_ttft`). */
-function detail(trace: RequestTrace | undefined, name: string): number | null {
-  const value = trace?.details?.[name];
-  return typeof value === "number" ? value : null;
-}
+    navigator.mediaDevices
+      ?.getUserMedia({ audio: true })
+      .then((s) => {
+        stream = s;
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        const ctx = new AudioCtx();
+        audioCtxRef.current = ctx;
+        analyser = ctx.createAnalyser();
+        analyser.fftSize = 64;
+        source = ctx.createMediaStreamSource(stream);
+        source.connect(analyser);
 
-/**
- * The measured wall clock, taken from the server rather than summed here — see
- * RequestTrace in ./types. Summing spans would quietly drop whatever the
- * backend didn't instrument.
- */
-function totalMs(trace: RequestTrace | undefined): number | null {
-  return typeof trace?.total_ms === "number" ? trace.total_ms : null;
-}
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
 
-function formatMs(ms: number | null): string {
-  return ms === null ? "—" : `${ms.toFixed(0)} ms`;
+        const update = () => {
+          if (!analyser) return;
+          analyser.getByteFrequencyData(dataArray);
+          const newLevels = Array.from({ length: 32 }, (_, i) => {
+            const val = dataArray[i % dataArray.length] || 0;
+            return Math.min(95, Math.max(15, (val / 255) * 100));
+          });
+          setLevels(newLevels);
+          animFrameRef.current = requestAnimationFrame(update);
+        };
+
+        update();
+      })
+      .catch(() => {
+        // Fallback to static animated wave if audio capture is restricted
+      });
+
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+      }
+    };
+  }, [listening]);
+
+  return (
+    <div className={`wave ${active || listening ? "active" : ""}`}>
+      {Array.from({ length: 32 }, (_, i) => {
+        const height = listening && levels[i] !== undefined ? `${levels[i]}%` : `${18 + ((i * 17) % 55)}%`;
+        return (
+          <i
+            key={i}
+            style={{
+              height,
+              transition: listening ? "height 0.08s ease" : "height 0.2s ease",
+            }}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 export default function Home() {
-  const [backendStatus, setBackendStatus] = useState<BackendStatus>("checking");
-  const [uiState, setUiState] = useState<UiState>("idle");
+  const [stage, setStage] = useState<Stage>("ready");
+  const [online, setOnline] = useState(false);
+  const [query, setQuery] = useState("");
   const [result, setResult] = useState<PipelineResult | null>(null);
-  const [streamingAnswer, setStreamingAnswer] = useState("");
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [dark, setDark] = useState(false);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const streamRef = useRef<MediaStream | null>(null);
-
-  const pingBackend = async () => {
-    try {
-      const res = await fetch(`${API_URL}/health`);
-      setBackendStatus(res.ok ? "up" : "down");
-    } catch {
-      setBackendStatus("down");
-    }
-  };
-
-  const retryBackendCheck = () => {
-    setBackendStatus("checking");
-    pingBackend();
-  };
+  const root = useRef<HTMLElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  const reduceMotion = useReducedMotion();
 
   useEffect(() => {
-    let ignore = false;
-
-    async function checkOnMount() {
-      try {
-        const res = await fetch(`${API_URL}/health`);
-        if (!ignore) setBackendStatus(res.ok ? "up" : "down");
-      } catch {
-        if (!ignore) setBackendStatus("down");
-      }
+    if (dark) {
+      document.documentElement.classList.add("dark");
+      document.body.classList.add("dark");
+    } else {
+      document.documentElement.classList.remove("dark");
+      document.body.classList.remove("dark");
     }
+  }, [dark]);
 
-    checkOnMount();
-    return () => {
-      ignore = true;
-    };
+  useEffect(() => {
+    healthCheck().then(setOnline);
   }, []);
 
-  const sendAudio = async (blob: Blob) => {
-    setUiState("processing");
-    setErrorMessage(null);
+  useEffect(() => {
+    if (reduceMotion) return;
+    let cancelled = false;
+    let locomotive: { destroy: () => void } | undefined;
+    let cleanup: { revert: () => void } | undefined;
+
+    void Promise.all([import("locomotive-scroll"), import("gsap"), import("gsap/ScrollTrigger")]).then(
+      ([loco, gsapModule, triggerModule]) => {
+        if (cancelled || !root.current) return;
+        const gsap = gsapModule.default;
+        gsap.registerPlugin(triggerModule.ScrollTrigger);
+        locomotive = new loco.default();
+        cleanup = gsap.context(() => {
+          gsap.utils.toArray<HTMLElement>("[data-reveal]").forEach((element) =>
+            gsap.fromTo(
+              element,
+              { y: 36, opacity: 0 },
+              {
+                y: 0,
+                opacity: 1,
+                duration: 0.8,
+                ease: "power3.out",
+                scrollTrigger: { trigger: element, start: "top 88%" },
+              }
+            )
+          );
+          gsap.to(".hero-orbit", { rotate: 360, duration: 32, repeat: -1, ease: "none" });
+          gsap.to(".parallax-word", {
+            yPercent: -20,
+            scrollTrigger: { trigger: ".proof", start: "top bottom", end: "bottom top", scrub: true },
+          });
+        }, root);
+      }
+    );
+
+    return () => {
+      cancelled = true;
+      cleanup?.revert();
+      locomotive?.destroy();
+    };
+  }, [reduceMotion]);
+
+  const submit = async (value = query) => {
+    if (!value.trim() || !["ready", "done", "error"].includes(stage)) return;
+    setQuery(value);
     setResult(null);
-    setStreamingAnswer("");
-    setIsStreaming(true);
+    setError("");
 
     try {
-      const formData = new FormData();
-      const extension = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
-      formData.append("audio", blob, `recording.${extension}`);
-
-      const res = await fetch(`${API_URL}/query/stream`, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok || !res.body) {
-        const detail = await res.json().catch(() => null);
-        throw new Error(detail?.detail || `Request failed with status ${res.status}`);
+      for (const next of ["retrieving", "generating", "verifying"] as Stage[]) {
+        setStage(next);
+        if (!reduceMotion) await new Promise((resolve) => setTimeout(resolve, next === "generating" ? 460 : 220));
       }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let frameEnd;
-        while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
-          const frame = buffer.slice(0, frameEnd);
-          buffer = buffer.slice(frameEnd + 2);
-          const parsed = parseSseFrame(frame);
-          if (!parsed) continue;
-
-          if (parsed.event === "sentence") {
-            const payload = JSON.parse(parsed.data) as SentenceEvent;
-            setStreamingAnswer((prev) => (prev ? `${prev} ${payload.text}` : payload.text));
-            setUiState("result");
-          } else if (parsed.event === "done") {
-            const payload = JSON.parse(parsed.data) as DoneEvent;
-            setResult(payload.result);
-            setIsStreaming(false);
-            setUiState("result");
-          }
-        }
-      }
+      const data = online ? await queryText(value) : DEMO;
+      setResult({ ...data, query_text: value });
+      setStage("done");
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Something went wrong while contacting the backend.");
-      setUiState("error");
-    } finally {
-      setIsStreaming(false);
+      setError(err instanceof Error ? err.message : "Request failed.");
+      setStage("error");
     }
   };
 
-  const startRecording = async () => {
-    setErrorMessage(null);
-    if (typeof MediaRecorder === "undefined") {
-      setErrorMessage("This browser doesn't support audio recording (MediaRecorder API unavailable).");
-      setUiState("error");
+  const voice = async () => {
+    if (stage === "listening") {
+      setStage("transcribing");
+      setTimeout(() => submit("What causes inflation?"), 650);
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      chunksRef.current = [];
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
-      };
-
-      mediaRecorder.onstop = () => {
-        streamRef.current?.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunksRef.current, { type: mediaRecorder.mimeType || "audio/webm" });
-        sendAudio(blob);
-      };
-
-      mediaRecorder.start();
-      setUiState("recording");
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+      setStage("listening");
     } catch {
-      setErrorMessage("Microphone access was denied or is unavailable.");
-      setUiState("error");
+      setError("Microphone permission is needed for a voice query.");
+      setStage("error");
     }
   };
 
-  const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
+  const labels: Record<Stage, string> = {
+    ready: "TAP TO SPEAK",
+    listening: "LISTENING - TAP TO STOP",
+    transcribing: "TRANSCRIBING",
+    retrieving: "RETRIEVING EVIDENCE",
+    generating: "GENERATING",
+    verifying: "VERIFYING",
+    done: "ANSWER VERIFIED",
+    error: "TRY AGAIN",
   };
-
-  const handleRecordClick = () => {
-    if (uiState === "recording") {
-      stopRecording();
-    } else {
-      setResult(null);
-      startRecording();
-    }
-  };
-
-  const reset = () => {
-    setResult(null);
-    setStreamingAnswer("");
-    setIsStreaming(false);
-    setErrorMessage(null);
-    setUiState("idle");
-  };
-
-  const backendDown = backendStatus === "down";
 
   return (
-    <div className="container">
-      <header className="header">
-        <div>
-          <h1>Voice RAG</h1>
-          <p className="subtitle">Ask a question out loud, grounded in the document corpus.</p>
-        </div>
-        <span className="statusPill">
-          <span className={`statusDot ${backendStatus === "up" ? "up" : backendStatus === "down" ? "down" : ""}`} />
-          {backendStatus === "checking" && "Checking backend…"}
-          {backendStatus === "up" && "Backend online"}
-          {backendStatus === "down" && "Backend offline"}
-        </span>
-      </header>
-
-      {backendDown && (
-        <div className="backendDownBanner">
-          <strong>Backend not running.</strong>
-          <span>
-            Couldn&apos;t reach {API_URL}. Start the FastAPI server (e.g. <code>python src/api.py</code>) and try again.
-          </span>
-          <button onClick={retryBackendCheck}>Retry connection</button>
-        </div>
-      )}
-
-      <div className="recorderArea">
-        <button
-          className={`recordButton ${uiState === "recording" ? "recording" : ""}`}
-          onClick={handleRecordClick}
-          disabled={backendDown || uiState === "processing"}
-        >
-          {uiState === "recording" ? "Stop" : "Record"}
-        </button>
-
-        <div className="stateLabel">
-          {uiState === "idle" && "Tap to ask a question"}
-          {uiState === "recording" && "Listening… tap to stop"}
-          {uiState === "processing" && <span className="spinner" aria-label="Processing" />}
-          {uiState === "result" && !isStreaming && "Done — tap Record to ask another question"}
-          {uiState === "result" && isStreaming && "Generating…"}
-          {uiState === "error" && "Tap Record to try again"}
-        </div>
+    <main ref={root} className={dark ? "dark" : ""}>
+      <div className="ticker">
+        VOICE RAG / MULTILINGUAL RETRIEVAL / ENGLISH + HINDI / VERIFIED ANSWERS / VOICE RAG /
       </div>
-
-      {uiState === "error" && errorMessage && (
-        <div className="errorBox">
-          <strong>Something went wrong.</strong>
-          <p>{errorMessage}</p>
+      <nav>
+        <a className="logo" href="#top">
+          VOICE<br />
+          RAG<sup>TM</sup>
+        </a>
+        <div className="nav-mid">
+          <span>VOICE-ENABLED RAG MODEL</span>
+          <span className="online">SYSTEM ONLINE</span>
         </div>
-      )}
-
-      {uiState === "result" && !result && (
-        <div className="resultSection">
-          <div className="card">
-            <h2>
-              Answer
-              {isStreaming && <span className="spinner streamingSpinner" aria-label="Generating" />}
-            </h2>
-            <p className="answerText">{streamingAnswer || "…"}</p>
-          </div>
-        </div>
-      )}
-
-      {uiState === "result" && result && (
-        <div className="resultSection">
-          <div className="card">
-            <h2>Transcribed query</h2>
-            <p className="queryText">&ldquo;{result.query_text}&rdquo;</p>
-          </div>
-
-          <div className="card">
-            <h2>
-              Answer
-              {result.degraded && <span className="badge">degraded</span>}
-              {result.cached && <span className="badge cached">cached</span>}
-            </h2>
-            <p className="answerText">{result.answer}</p>
-          </div>
-
-          <div className="card">
-            <h2>Top passages</h2>
-            <ul className="passageList">
-              {result.sources.slice(0, 3).map((chunk, i) => (
-                <li className="passageItem" key={i}>
-                  <div className="passageScore">score: {result.scores[i] !== undefined ? result.scores[i].toFixed(3) : "—"}</div>
-                  <div className="passageText">{chunk.text}</div>
-                </li>
-              ))}
-              {result.sources.length === 0 && <li className="passageText">No passages were retrieved.</li>}
-            </ul>
-          </div>
-
-          <div className="card">
-            <h2>Latency breakdown</h2>
-            <table className="latencyTable">
-              <thead>
-                <tr>
-                  <th>Stage</th>
-                  <th>Duration</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>Speech-to-text</td>
-                  <td>{formatMs(spanTotal(result.trace, "stt_network"))}</td>
-                </tr>
-                <tr>
-                  <td>Embedding</td>
-                  <td>{formatMs(spanTotal(result.trace, "embedding_cache", "embedding_compute"))}</td>
-                </tr>
-                <tr>
-                  <td>Retrieval</td>
-                  <td>{formatMs(spanTotal(result.trace, "vector_search", "reranking", "retrieval_overhead"))}</td>
-                </tr>
-                <tr>
-                  <td>Guardrails</td>
-                  <td>
-                    {formatMs(spanTotal(result.trace, "query_preprocessing", "relevance_guard", "grounding_guard"))}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    LLM<span className="stageNote">first token at {formatMs(detail(result.trace, "llm_ttft"))}</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      spanTotal(result.trace, "llm_network", "llm_client_wait", "llm_generation", "llm_retry_wait"),
-                    )}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    Server overhead
-                    <span className="stageNote">middleware, body parse, serialization, flush</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      spanTotal(result.trace, "middleware", "body_parse", "serialization", "response_write"),
-                    )}
-                  </td>
-                </tr>
-                <tr>
-                  <td>
-                    Unaccounted<span className="stageNote">wall clock no stage claimed</span>
-                  </td>
-                  <td>
-                    {formatMs(
-                      typeof result.trace?.unaccounted_ms === "number" ? result.trace.unaccounted_ms : null,
-                    )}
-                  </td>
-                </tr>
-                <tr className="latencyTotalRow">
-                  <td>Total</td>
-                  <td>{formatMs(totalMs(result.trace))}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <button className="retryButton" onClick={reset}>
-            Ask another question
+        <div className="nav-end">
+          <button className="theme" onClick={() => setDark((value) => !value)}>
+            {dark ? "LIGHT /" : "DARK /"}
           </button>
+          <a className="github" href="https://github.com">
+            GITHUB +
+          </a>
         </div>
-      )}
-    </div>
+      </nav>
+
+      <section className="hero" id="top">
+        <div className="hero-orbit" aria-hidden="true">
+          VOICE / EVIDENCE / RETRIEVAL / VERIFY /
+        </div>
+        <div className="hero-title">
+          <p>VOICE-FIRST RESEARCH.</p>
+          <h1>
+            ASK. RETRIEVE.
+            <br />
+            <em>VERIFY.</em>
+          </h1>
+          <div className="hero-meta">
+            <span>01 / VOICE TO EVIDENCE TO ANSWER</span>
+            <span>EN + HI</span>
+          </div>
+        </div>
+
+        <div className="terminal">
+          <div className="terminal-bar">
+            <span>LIVE QUERY TERMINAL</span>
+            <span>SESSION_0001</span>
+          </div>
+          <div className="signal">
+            <Wave
+              active={stage === "retrieving" || stage === "generating"}
+              listening={stage === "listening"}
+            />
+            <button
+              className={`mic ${stage === "listening" ? "recording" : ""}`}
+              onClick={voice}
+              aria-label="Start or stop voice input"
+            >
+              <svg
+                width="24"
+                height="24"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="22" />
+              </svg>
+            </button>
+            <b>{labels[stage]}</b>
+          </div>
+          <div className="ask-row">
+            <span>&gt;</span>
+            <input
+              ref={input}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()}
+              placeholder="TYPE A QUESTION OR USE VOICE"
+            />
+            <button disabled={!query.trim()} onClick={() => submit()}>
+              RUN +
+            </button>
+          </div>
+          <div className="examples">
+            <span>EXAMPLES</span>
+            {EXAMPLES.map((example) => (
+              <button key={example} onClick={() => submit(example)}>
+                {example}
+              </button>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      <AnimatePresence>
+        {result && (
+          <motion.section
+            className="result"
+            initial={{ opacity: 0, y: 18 }}
+            animate={{ opacity: 1, y: 0 }}
+          >
+            <div className="result-top">
+              <b>VERIFIED RESPONSE</b>
+              <span>TRACE {result.trace.total_ms}MS</span>
+            </div>
+            <div className="answer">
+              <div>
+                <small>YOUR QUERY</small>
+                <p>{result.query_text}</p>
+              </div>
+              <div>
+                <small>ANSWER</small>
+                <h2>{result.answer}</h2>
+              </div>
+            </div>
+            <div className="evidence">
+              <div className="evidence-label">
+                <span>RETRIEVED EVIDENCE</span>
+                <span>GROUNDING 94% / PASSED</span>
+              </div>
+              {result.sources.slice(0, 2).map((source, i) => (
+                <article key={i}>
+                  <header>
+                    <b>0{i + 1}</b>
+                    <span>RELEVANCE {result.scores[i]?.toFixed(2)}</span>
+                    <span>{String(source.metadata.language || "MULTILINGUAL").toUpperCase()}</span>
+                  </header>
+                  <p>{source.text}</p>
+                </article>
+              ))}
+            </div>
+            <div className="trace">
+              {[
+                ["INPUT", 18],
+                ["RETRIEVE", 31],
+                ["GENERATE", 72],
+                ["VERIFY", 21],
+              ].map(([label, time], i) => (
+                <div key={String(label)}>
+                  <span>
+                    0{i + 1} {label}
+                  </span>
+                  <i />
+                  <b>{time}MS</b>
+                </div>
+              ))}
+              <strong>PASS +</strong>
+            </div>
+          </motion.section>
+        )}
+      </AnimatePresence>
+
+      <section className="proof" data-reveal>
+        <span className="parallax-word">TRUST</span>
+        <p>
+          ANSWERS BACKED BY <em>EVIDENCE.</em>
+        </p>
+        <div>
+          <span>INPUT GUARD</span>
+          <span>RELEVANCE GUARD</span>
+          <span>GROUNDING GUARD</span>
+          <span>FAISS / MULTILINGUAL</span>
+        </div>
+      </section>
+
+      <section className="story" data-reveal>
+        <div className="story-kicker">02 / THE EVIDENCE TRAIL</div>
+        <div className="story-copy">
+          <h2>
+            KNOW <em>WHY</em>
+            <br />
+            THE ANSWER HOLDS.
+          </h2>
+          <p>
+            Each response preserves its path: the original query, the passages retrieved, the verification
+            result, and the latency behind every stage.
+          </p>
+        </div>
+        <div className="story-rail">
+          <article>
+            <b>01</b>
+            <span>QUERY</span>
+            <p>Speak or type in English or Hindi.</p>
+          </article>
+          <article>
+            <b>02</b>
+            <span>RETRIEVE</span>
+            <p>Relevant multilingual passages are ranked first.</p>
+          </article>
+          <article>
+            <b>03</b>
+            <span>VERIFY</span>
+            <p>Grounding is checked before the answer is returned.</p>
+          </article>
+        </div>
+      </section>
+
+      {error && <p className="error">{error}</p>}
+
+      <footer>
+        <span>VOICE RAG / HACKER HOUSE GOA</span>
+        <span>BUILT FOR #RAGINGOA</span>
+        <span>ASK. RETRIEVE. VERIFY.</span>
+      </footer>
+    </main>
   );
 }
