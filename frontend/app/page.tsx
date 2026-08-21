@@ -1,32 +1,14 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { PipelineResult, RequestTrace } from "./types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const MOTION_MS = 200;
+const AUDIO_BUFFER_SIZE = 512;
 
 type BackendStatus = "checking" | "up" | "down";
 type UiState = "idle" | "recording" | "processing" | "result" | "error";
-
-interface SentenceEvent {
-  event: "sentence";
-  text: string;
-}
-
-interface DoneEvent {
-  event: "done";
-  result: PipelineResult;
-}
-
-function parseSseFrame(frame: string): { event: string; data: string } | null {
-  let eventType = "message";
-  let data = "";
-  for (const line of frame.split("\n")) {
-    if (line.startsWith("event:")) eventType = line.slice(6).trim();
-    else if (line.startsWith("data:")) data += line.slice(5).trim();
-  }
-  return data ? { event: eventType, data } : null;
-}
 
 /**
  * Total duration of the named spans, or null if none of them ran.
@@ -92,12 +74,66 @@ export default function Home() {
   const [uiState, setUiState] = useState<UiState>("idle");
   const [result, setResult] = useState<PipelineResult | null>(null);
   const [streamingAnswer, setStreamingAnswer] = useState("");
+  const [liveTranscript, setLiveTranscript] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const realtimeSocketRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
+  const sttTimingRef = useRef({
+    audioAvailableMs: null as number | null,
+    firstAudioSentMs: null as number | null,
+    firstPartialReceivedMs: null as number | null,
+    firstPartialText: "",
+  });
+
+  const sendPcmFrame = (samples: Float32Array, inputRate: number) => {
+    const now = performance.now();
+    if (sttTimingRef.current.audioAvailableMs === null) {
+      sttTimingRef.current.audioAvailableMs = now;
+    }
+    const ratio = inputRate / 16000;
+    const outputLength = Math.floor(samples.length / ratio);
+    const pcm = new Int16Array(outputLength);
+    for (let i = 0; i < outputLength; i += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[Math.floor(i * ratio)]));
+      pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+    }
+    let binary = "";
+    const bytes = new Uint8Array(pcm.buffer);
+    for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+    const socket = realtimeSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ event: "audio_input", audio: btoa(binary) }));
+      if (sttTimingRef.current.firstAudioSentMs === null) {
+        sttTimingRef.current.firstAudioSentMs = performance.now();
+      }
+    }
+  };
+
+  const finishRealtimeAudio = () => {
+    workletRef.current?.disconnect();
+    audioSourceRef.current?.disconnect();
+    audioContextRef.current?.close();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    workletRef.current = null;
+    audioSourceRef.current = null;
+    audioContextRef.current = null;
+  };
+
+  const submitTranscript = async (transcript: string) => {
+    const res = await fetch(`${API_URL}/query/text`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: transcript }),
+    });
+    if (!res.ok) throw new Error(`RAG request failed with status ${res.status}`);
+    setResult((await res.json()) as PipelineResult);
+    setUiState("result");
+  };
 
   const pingBackend = async () => {
     try {
@@ -131,91 +167,99 @@ export default function Home() {
     };
   }, []);
 
-  const sendAudio = async (blob: Blob) => {
-    setUiState("processing");
-    setErrorMessage(null);
-    setResult(null);
-    setStreamingAnswer("");
-    setIsStreaming(true);
-
-    try {
-      const formData = new FormData();
-      const extension = blob.type.includes("webm") ? "webm" : blob.type.includes("ogg") ? "ogg" : "wav";
-      formData.append("audio", blob, `recording.${extension}`);
-
-      const res = await fetch(`${API_URL}/query/stream`, {
-        method: "POST",
-        body: formData,
+  useLayoutEffect(() => {
+    const timing = sttTimingRef.current;
+    if (timing.firstPartialReceivedMs !== null && liveTranscript === timing.firstPartialText) {
+      const renderedMs = performance.now();
+      console.info("stt_first_partial_latency", {
+        capture_to_render_ms: renderedMs - (timing.audioAvailableMs ?? renderedMs),
+        capture_to_send_ms: (timing.firstAudioSentMs ?? renderedMs) - (timing.audioAvailableMs ?? renderedMs),
+        send_to_receive_ms: timing.firstPartialReceivedMs - (timing.firstAudioSentMs ?? timing.firstPartialReceivedMs),
+        receive_to_render_ms: renderedMs - timing.firstPartialReceivedMs,
       });
-
-      if (!res.ok || !res.body) {
-        const detail = await res.json().catch(() => null);
-        throw new Error(detail?.detail || `Request failed with status ${res.status}`);
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let frameEnd;
-        while ((frameEnd = buffer.indexOf("\n\n")) !== -1) {
-          const frame = buffer.slice(0, frameEnd);
-          buffer = buffer.slice(frameEnd + 2);
-          const parsed = parseSseFrame(frame);
-          if (!parsed) continue;
-
-          if (parsed.event === "sentence") {
-            const payload = JSON.parse(parsed.data) as SentenceEvent;
-            setStreamingAnswer((prev) => (prev ? `${prev} ${payload.text}` : payload.text));
-            setUiState("result");
-          } else if (parsed.event === "done") {
-            const payload = JSON.parse(parsed.data) as DoneEvent;
-            setResult(payload.result);
-            setIsStreaming(false);
-            setUiState("result");
-          }
-        }
-      }
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Something went wrong while contacting the backend.");
-      setUiState("error");
-    } finally {
-      setIsStreaming(false);
+      timing.firstPartialText = "";
     }
-  };
+  }, [liveTranscript]);
 
   const startRecording = async () => {
     setErrorMessage(null);
-    if (typeof MediaRecorder === "undefined") {
-      setErrorMessage("This browser doesn't support audio recording (MediaRecorder API unavailable).");
+    if (typeof AudioContext === "undefined" || typeof WebSocket === "undefined") {
+      setErrorMessage("This browser doesn't support realtime audio capture.");
       setUiState("error");
       return;
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
-      chunksRef.current = [];
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) chunksRef.current.push(event.data);
+      setLiveTranscript("");
+      sttTimingRef.current = {
+        audioAvailableMs: null,
+        firstAudioSentMs: null,
+        firstPartialReceivedMs: null,
+        firstPartialText: "",
       };
-
-      mediaRecorder.onstop = () => {
-        streamRef.current?.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(chunksRef.current, { type: mediaRecorder.mimeType || "audio/webm" });
-        sendAudio(blob);
+      const configResponse = await fetch(`${API_URL}/stt/realtime/config`);
+      const realtimeConfig = configResponse.ok
+        ? (await configResponse.json()) as {
+            direct?: boolean;
+            url?: string;
+            protocol?: string;
+            query?: Record<string, string>;
+          }
+        : null;
+      const socketUrl = realtimeConfig?.direct && realtimeConfig.url && realtimeConfig.query
+        ? `${realtimeConfig.url}?${new URLSearchParams(realtimeConfig.query)}`
+        : `${API_URL.replace(/^http/, "ws")}/stt/realtime`;
+      const socket = realtimeConfig?.direct && realtimeConfig.protocol
+        ? new WebSocket(socketUrl, realtimeConfig.protocol)
+        : new WebSocket(socketUrl);
+      realtimeSocketRef.current = socket;
+      socket.onmessage = (event) => {
+        const message = JSON.parse(event.data) as { event?: string; text?: string };
+        if (message.event === "transcript.partial" && message.text) {
+          if (sttTimingRef.current.firstPartialReceivedMs === null) {
+            sttTimingRef.current.firstPartialReceivedMs = performance.now();
+            sttTimingRef.current.firstPartialText = message.text;
+          }
+          setLiveTranscript(message.text);
+        }
+        if (message.event === "transcript.final" && message.text) {
+          setLiveTranscript(message.text);
+          finishRealtimeAudio();
+          socket.close();
+          submitTranscript(message.text).catch((error: unknown) => {
+            setErrorMessage(error instanceof Error ? error.message : "Could not answer the transcript.");
+            setUiState("error");
+          });
+        }
       };
-
-      mediaRecorder.start();
-      setUiState("recording");
+      socket.onerror = () => {
+        finishRealtimeAudio();
+        setErrorMessage("Realtime speech recognition is unavailable.");
+        setUiState("error");
+      };
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener("open", () => resolve(), { once: true });
+        socket.addEventListener("error", () => reject(new Error("Realtime speech connection failed.")), { once: true });
+      });
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      const source = audioContext.createMediaStreamSource(stream);
+      if (!audioContext.audioWorklet) throw new Error("AudioWorklet is required for realtime capture.");
+      await audioContext.audioWorklet.addModule("/audio-capture-worklet.js");
+      const worklet = new AudioWorkletNode(audioContext, "audio-capture-processor");
+      worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
+        sendPcmFrame(event.data, audioContext.sampleRate);
+      };
+      source.connect(worklet);
+      // Keep the graph active without monitoring the microphone. The worklet
+      // emits silent output, so captured audio cannot echo through speakers.
+      worklet.connect(audioContext.destination);
+      workletRef.current = worklet;
+      audioContextRef.current = audioContext;
+      audioSourceRef.current = source;
+      requestAnimationFrame(() => {
+        setUiState("recording");
+      });
     } catch {
       setErrorMessage("Microphone access was denied or is unavailable.");
       setUiState("error");
@@ -223,7 +267,11 @@ export default function Home() {
   };
 
   const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
+    finishRealtimeAudio();
+    realtimeSocketRef.current?.send(JSON.stringify({ event: "end" }));
+    window.setTimeout(() => {
+      setUiState("processing");
+    }, MOTION_MS);
   };
 
   const handleRecordClick = () => {
@@ -238,6 +286,7 @@ export default function Home() {
   const reset = () => {
     setResult(null);
     setStreamingAnswer("");
+    setLiveTranscript("");
     setIsStreaming(false);
     setErrorMessage(null);
     setUiState("idle");
@@ -288,6 +337,13 @@ export default function Home() {
           {uiState === "error" && "Tap Record to try again"}
         </div>
       </div>
+
+      {uiState === "recording" && liveTranscript && (
+        <div className="card">
+          <h2>Live transcript</h2>
+          <p className="queryText">{liveTranscript}</p>
+        </div>
+      )}
 
       {uiState === "error" && errorMessage && (
         <div className="errorBox">

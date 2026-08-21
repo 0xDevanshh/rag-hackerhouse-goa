@@ -13,6 +13,8 @@ import logging
 import os
 import sys
 import uuid
+import asyncio
+import json as json_module
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -25,10 +27,11 @@ if __name__ == "__main__" and str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+import websockets
 
 from src import data_loader
 from src.chunking import ChunkerRegistry
@@ -70,6 +73,7 @@ logger = logging.getLogger("src.api")
 
 DEFAULT_CORPUS_PATH = ROOT_DIR / "data" / "sample_corpus.json"
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "http://localhost:3000")
+SARVAM_REALTIME_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 
 # Corpus selection. The served index is ai4bharat/MSMARCO-XI by default,
 # indexed in both the target language and the original English (so a query in
@@ -328,6 +332,136 @@ def _request_trace(request: Request) -> RequestTrace:
 def health() -> dict:
     """Liveness check for the frontend to confirm the backend is reachable."""
     return {"status": "ok"}
+
+
+@app.get("/stt/realtime/config")
+def realtime_stt_config() -> JSONResponse:
+    """Return a browser-safe realtime config when a short-lived token is supplied.
+
+    Sarvam documents API keys, but does not document a token-mint endpoint. A
+    deployment may inject a separately scoped, short-lived token as
+    SARVAM_REALTIME_TOKEN. The long-lived SARVAM_API_KEY is never returned.
+    Without that token, the browser must use the server proxy below.
+    """
+    token = os.environ.get("SARVAM_REALTIME_TOKEN")
+    if not token or token.startswith("your_"):
+        return JSONResponse(status_code=404, content={"direct": False})
+    return {
+        "direct": True,
+        "url": SARVAM_REALTIME_URL,
+        "protocol": f"api-subscription-key.{token}",
+        "query": {
+            "language_code": "auto",
+            "model": "saaras:v3-realtime",
+            "stream_type": "fast",
+            "endpointing": "vad",
+            "encoding": "linear16",
+            "sample_rate": "16000",
+            "mode": "transcribe",
+            "prefix_padding_ms": "100",
+            # Lower endpointing reduces final-result delay, at a small risk of
+            # cutting off speech during natural pauses; partials are unaffected.
+            "silence_duration_ms": "100",
+            "min_speech_duration_ms": "100",
+        },
+    }
+
+
+@app.websocket("/stt/realtime")
+async def stt_realtime(websocket: WebSocket) -> None:
+    """Proxy browser PCM frames to Sarvam realtime STT without exposing the key."""
+    await websocket.accept()
+    session_started = asyncio.get_running_loop().time()
+    first_audio_received: float | None = None
+    first_audio_forwarded: float | None = None
+    first_partial_received: float | None = None
+    last_audio_received: float | None = None
+    last_partial_received: float | None = None
+    audio_frames = 0
+    audio_bytes = 0
+    api_key = os.environ.get("SARVAM_API_KEY")
+    if not api_key or api_key.startswith("your_"):
+        await websocket.close(code=1011, reason="SARVAM_API_KEY is not configured")
+        return
+
+    query = (
+        "language_code=auto&model=saaras:v3-realtime&stream_type=fast&"
+        "endpointing=vad&encoding=linear16&sample_rate=16000&mode=transcribe&"
+        "prefix_padding_ms=100&silence_duration_ms=100&min_speech_duration_ms=100"
+    )
+    upstream_url = f"wss://api.sarvam.ai/speech-to-text-realtime/ws?{query}"
+    try:
+        async with websockets.connect(
+            upstream_url,
+            subprotocols=[f"api-subscription-key.{api_key}"],
+            ping_interval=20,
+            open_timeout=10,
+        ) as upstream:
+            async def client_to_sarvam() -> None:
+                nonlocal first_audio_received, first_audio_forwarded, last_audio_received, audio_frames, audio_bytes
+                while True:
+                    message = await websocket.receive_text()
+                    payload = json_module.loads(message)
+                    if payload.get("event") == "audio_input":
+                        received_at = asyncio.get_running_loop().time()
+                        if first_audio_received is None:
+                            first_audio_received = received_at
+                        last_audio_received = received_at
+                        audio_frames += 1
+                        audio_bytes += len(payload.get("audio", "")) * 3 // 4
+                        if first_audio_forwarded is None:
+                            first_audio_forwarded = received_at
+                    await upstream.send(message)
+
+            async def sarvam_to_client() -> None:
+                nonlocal first_partial_received, last_partial_received
+                async for message in upstream:
+                    if first_partial_received is None:
+                        try:
+                            if json_module.loads(message).get("event") == "transcript.partial":
+                                first_partial_received = asyncio.get_running_loop().time()
+                        except (TypeError, json_module.JSONDecodeError):
+                            pass
+                    if first_partial_received is not None:
+                        last_partial_received = asyncio.get_running_loop().time()
+                    await websocket.send_text(message)
+
+            forward_task = asyncio.create_task(client_to_sarvam())
+            receive_task = asyncio.create_task(sarvam_to_client())
+            done, pending = await asyncio.wait(
+                {forward_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exception = task.exception()
+                if exception and not isinstance(exception, (WebSocketDisconnect, websockets.ConnectionClosed)):
+                    raise exception
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        logger.warning("realtime STT proxy closed: %s", exc)
+        if websocket.client_state.value == "CONNECTED":
+            await websocket.close(code=1011, reason="realtime STT unavailable")
+    finally:
+        ended = asyncio.get_running_loop().time()
+        logger.info(
+            "realtime_stt frames=%d audio_ms=%.1f receive_ms=%s forward_ms=%s "
+            "first_partial_ms=%s first_partial_after_audio_ms=%s "
+            "upstream_partial_window_ms=%s session_ms=%.1f",
+            audio_frames,
+            audio_bytes / 32.0,
+            f"{(first_audio_received - session_started) * 1000:.1f}" if first_audio_received else "none",
+            f"{(first_audio_forwarded - session_started) * 1000:.1f}" if first_audio_forwarded else "none",
+            f"{(first_partial_received - session_started) * 1000:.1f}" if first_partial_received else "none",
+            f"{(first_partial_received - first_audio_received) * 1000:.1f}"
+            if first_partial_received and first_audio_received
+            else "none",
+            f"{(last_partial_received - first_partial_received) * 1000:.1f}"
+            if last_partial_received and first_partial_received
+            else "none",
+            (ended - session_started) * 1000,
+        )
 
 
 @app.get("/ready")
