@@ -466,6 +466,7 @@ class PipelineHarness:
         retrieval_result: RetrievalResult,
         trace: RequestTrace,
         errors: list[StageError],
+        generator: "Generator | None" = None,
     ) -> str | None:
         """
         Build the prompt and generate, recording context_build / llm_network /
@@ -481,8 +482,9 @@ class PipelineHarness:
             trace.label("prompt_chars", len(SYSTEM_PROMPT) + len(user_message))
 
         timing: dict[str, float] = {}
+        active_generator = generator if generator is not None else self.generator
         try:
-            return await self.generator.answer_streamed(query_text, retrieved_chunks, timing=timing)
+            return await active_generator.answer_streamed(query_text, retrieved_chunks, timing=timing)
         except Exception as exc:
             errors.append(StageError(stage="generation", error_type=type(exc).__name__, message=str(exc)))
             return None
@@ -543,6 +545,7 @@ class PipelineHarness:
         content_type: str | None = None,
         trace: RequestTrace | None = None,
         scope: str | None = None,
+        generator: "Generator | None" = None,
     ) -> PipelineResult:
         """
         Run one request through the full pipeline.
@@ -569,6 +572,11 @@ class PipelineHarness:
                 omitted, e.g. when called from a benchmark.
             scope: overrides the harness-level cache isolation scope for this
                 request.
+            generator: override the harness-level Generator for this request
+                only.  Pass a Generator(ExtractiveProvider()) to force the
+                local zero-network path for the fast/text endpoints, or None
+                to use the harness's configured generator (Groq/Anthropic in
+                production).  Does not mutate self.generator.
 
         Returns:
             PipelineResult: the final answer, its source chunks, a full
@@ -684,7 +692,7 @@ class PipelineHarness:
         # inside _chunk_vectors_for — re-encoding chunk texts when positions
         # aren't available — is the 17-23ms case this actually hides.)
         answer_text, chunk_vectors = await asyncio.gather(
-            self._generate_stage(query_text, retrieval_result, trace, errors),
+            self._generate_stage(query_text, retrieval_result, trace, errors, generator=generator),
             self._chunk_vectors_for(retrieval_result),
         )
         if answer_text is None:

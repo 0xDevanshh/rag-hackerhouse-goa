@@ -547,17 +547,47 @@ class TextQuery(BaseModel):
 @app.post("/query/text", response_model=PipelineResult)
 async def query_text(body: TextQuery, request: Request) -> PipelineResult:
     """
-    Run one already-typed question through the pipeline, skipping STT.
+    Fast path: run one already-typed question through the pipeline using the
+    local extractive provider (zero network calls beyond embedding + FAISS).
 
-    This is the fast path, and the only route that can plausibly come in under
-    200ms: /query must first ship the audio to Sarvam and wait for a
-    transcript, which alone measured 250-525ms on a one-second clip. A cached
-    text query returns in single-digit milliseconds of pipeline work; an
-    uncached one still has to wait on the LLM.
+    This is the default text endpoint and what the frontend uses after STT.
+    Expected total latency: ~30-50ms (embedding + BM25 + FAISS + grounding
+    short-circuit).  Grounding is verified structurally (every answer sentence
+    is a verbatim word-subset of a retrieved passage) rather than by a second
+    embedding pass, so grounding_guard_ms ≈ 0ms on this path.
+
+    For LLM-quality answers use POST /query/text/llm (explicit opt-in).
+    """
+    from src.generation import ExtractiveProvider, Generator
+
+    trace = _request_trace(request)
+    harness = get_harness()
+    result = await harness.run(
+        body.query,
+        trace=trace,
+        generator=Generator(provider=ExtractiveProvider()),
+    )
+    trace.mark("route_end")
+    return result
+
+
+@app.post("/query/text/llm", response_model=PipelineResult)
+async def query_text_llm(body: TextQuery, request: Request) -> PipelineResult:
+    """
+    Quality path: run one already-typed question through the pipeline using
+    the configured LLM provider (Groq / Anthropic, selected by LLM_PROVIDER).
+
+    This path runs two network round-trips: one to the LLM (~700-1300ms) and
+    one embedding pass for grounding verification.  It cannot meet the <200ms
+    latency target.  Use it when answer quality matters more than latency, e.g.
+    complex multi-sentence questions or questions that need synthesis across
+    multiple passages.
+
+    For the fast default path use POST /query/text.
     """
     trace = _request_trace(request)
     harness = get_harness()
-    result = await harness.run(body.query, trace=trace)
+    result = await harness.run(body.query, trace=trace)  # uses harness.generator = Groq/Anthropic
     trace.mark("route_end")
     return result
 

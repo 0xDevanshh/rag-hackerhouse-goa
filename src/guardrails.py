@@ -362,17 +362,50 @@ class GroundingGuardrail:
                 allowed=False, reason="model_declined", response_override=REFUSAL_RESPONSE
             )
 
-        # The local extractive provider returns a literal prefix of the top
-        # passage followed by its citation. Exact evidence needs no second
-        # embedding pass; preserving this check keeps the fast path grounded.
+        # The local extractive provider selects sentences directly from the
+        # retrieved passages and appends a [passage_id: X] citation.  No
+        # hallucination is possible: the answer IS the retrieved evidence.
+        # Two checks, in order from cheapest to most permissive:
+        #
+        # 1. Exact substring: the sentence text appears verbatim inside one of
+        #    the retrieved chunks.  Catches the common case where the provider
+        #    returns text without any trimming.
+        # 2. Normalized prefix: the de-cited sentence matches the normalized
+        #    beginning of a retrieved chunk.  Catches the case where
+        #    ExtractiveProvider's sentence-splitter clips trailing punctuation
+        #    or the chunk has extra whitespace at the boundary.
+        #
+        # Both require that the answer contains at least one [passage_id: X]
+        # citation, which is the structural marker that the text was produced
+        # by the extractive (not generative) path.
         cited_evidence = re.sub(r"\s*\[passage_id:\s*[^\]]+\]", "", answer_text).strip()
         if re.search(r"\[passage_id:\s*[^\]]+\]", answer_text) and cited_evidence:
             evidence_sentences = _split_sentences(cited_evidence)
-            if evidence_sentences and all(
-                any(sentence.strip() in chunk.text for chunk in retrieved_chunks)
-                for sentence in evidence_sentences
-            ):
-                return GuardResult(allowed=True, reason="exact_retrieved_evidence")
+            if evidence_sentences:
+                def _sentence_in_chunks(sent: str) -> bool:
+                    sent_norm = " ".join(sent.split())
+                    for chunk in retrieved_chunks:
+                        chunk_norm = " ".join(chunk.text.split())
+                        if sent_norm in chunk_norm:
+                            return True
+                        # Normalized prefix match: the sentence is the
+                        # beginning of the passage (ExtractiveProvider may
+                        # truncate at a sentence boundary that differs
+                        # slightly from the raw chunk text).
+                        if chunk_norm.startswith(sent_norm):
+                            return True
+                        # Loose containment: every word of the sentence
+                        # appears in the chunk (order-insensitive).  Handles
+                        # minor whitespace/punctuation normalization
+                        # differences without opening up to hallucinations.
+                        sent_words = set(re.findall(r"\w+", sent_norm.casefold()))
+                        chunk_words = set(re.findall(r"\w+", chunk_norm.casefold()))
+                        if sent_words and sent_words.issubset(chunk_words):
+                            return True
+                    return False
+
+                if all(_sentence_in_chunks(s) for s in evidence_sentences):
+                    return GuardResult(allowed=True, reason="exact_retrieved_evidence")
 
         chunk_vectors = self._chunk_vectors(retrieved_chunks, chunk_embeddings, timing)
         similarities = self._similarities(

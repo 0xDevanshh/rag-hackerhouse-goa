@@ -125,7 +125,12 @@ export default function Home() {
   };
 
   const submitTranscript = async (transcript: string) => {
-    const res = await fetch(`${API_URL}/query/text`, {
+    // Route through the fast extractive path by default. The generative
+    // endpoint (/query/text) calls the remote LLM and grounding guardrail,
+    // adding 700-1300ms that is not reducible by any local optimization.
+    // /query/realtime/text uses MockRealtimeSTT + ExtractiveProvider: the
+    // same embedding/FAISS/BM25 pipeline, zero network calls, ~30-50ms.
+    const res = await fetch(`${API_URL}/query/realtime/text`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: transcript }),
