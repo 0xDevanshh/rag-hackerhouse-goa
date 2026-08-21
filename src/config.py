@@ -24,6 +24,7 @@ class Settings(BaseModel):
     sarvam_api_key: str | None = None
     groq_api_key: str | None = None
     anthropic_api_key: str | None = None
+    hf_token: str | None = None
     llm_provider: str = "groq"
     embedding_model_name: str = "paraphrase-multilingual-MiniLM-L12-v2"
     corpus_language: str = "hi"
@@ -47,6 +48,7 @@ def load_settings() -> Settings:
         sarvam_api_key=os.getenv("SARVAM_API_KEY") or None,
         groq_api_key=os.getenv("GROQ_API_KEY") or None,
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or None,
+        hf_token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or None,
         llm_provider=os.getenv("LLM_PROVIDER", "groq"),
         embedding_model_name=os.getenv("EMBEDDING_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"),
         corpus_language=os.getenv("CORPUS_LANGUAGE", "hi"),
