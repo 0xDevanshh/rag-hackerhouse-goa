@@ -1,3 +1,8 @@
+# Keep the backend on CPU-only PyTorch on Railway / Linux builds.
+# The default torch package from PyPI pulls in the CUDA stack and can blow
+# up container memory / startup time for a tiny CPU RAG service.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
 sentence-transformers
 faiss-cpu
 numpy

@@ -306,27 +306,88 @@ async def phase_cold(voice: bool) -> dict:
 
 
 async def phase_warm_and_cached(reps: int, voice: bool, delay: float) -> dict:
-    """Warmed process: `reps` distinct uncached queries, then `reps` cached repeats."""
+    """Warmed process: `reps` distinct uncached queries, then `reps` cached repeats.
+
+    Voice path note:
+        The real SarvamSTT round-trip (P50 ~395ms, max ~1492ms) is a
+        network-bound stage outside the pipeline's control and is benchmarked
+        separately by run_benchmark.py's run_stt_benchmark(). Including it in
+        every warm-phase request here would:
+          (a) require a live SARVAM_API_KEY in the benchmark environment,
+          (b) serialize the per-request delay with a wildly variable network
+              call, making the pipeline's own stages nearly unmeasurable.
+
+        Instead, MockSTT is injected for the voice warm/cached phases — exactly
+        as run_benchmark.py does — so that the measured latency covers
+        everything the pipeline controls (embedding, FAISS, BM25, RRF, LLM,
+        guardrails) while the STT contribution is reported separately.
+
+        The previous implementation sent _silent_wav() bytes to POST /query
+        with no STT mock. Without SARVAM_API_KEY, _transcribe_stage caught the
+        ValueError and returned a 1-2ms degraded response — a fast failure, not
+        a pipeline execution. With a key, SarvamSTT transcribed silence to an
+        empty string, InputGuardrail rejected it in <1ms, and the result was
+        the same: all 20 warm requests recorded total_ms ~1.2ms with zero
+        embedding/retrieval/LLM spans. That data was physically impossible for
+        a real RAG run and must not be reported as a latency measurement.
+
+        The fix: for the voice path, replace the harness's STT client with
+        MockSTT and send text queries (not audio bytes) through the text
+        endpoint — or, equivalently, inject MockSTT and drive POST /query with
+        a silent clip whose transcript is pre-loaded into MockSTT. The latter
+        keeps the multipart body-parse and routing overhead in the measurement;
+        the former is simpler and equally honest about pipeline latency.
+    """
     app, manager, startup_ms = await _build_app(prewarm=True)
     try:
-        # reps + 1: the last one is reserved for priming the answer cache, so
-        # the cached phase measures a query that was never part of the warm
-        # sample (and the warm sample stays entirely uncached).
+        # reps + 1: the last one is reserved for priming the answer cache.
         queries = load_queries(reps + 1)
-        warm_payload = [_silent_wav() for _ in range(reps)] if voice else queries[:reps]
-        warm_rows = await _drive(app, warm_payload, voice, delay=delay)
 
-        # Prime the answer cache, then measure repeats of the same query. The
-        # cached phase needs no pacing: a hit never reaches the provider.
-        cached_payload = _silent_wav() if voice else queries[reps]
-        prime = await _drive(app, [cached_payload], voice, delay=delay)
-        if prime and prime[0].get("degraded"):
-            # A degraded response is never cached, so the "cached" phase would
-            # silently measure misses. Retry the prime once after a full
-            # rate-limit window rather than report a polluted phase.
-            await asyncio.sleep(60)
-            prime = await _drive(app, [cached_payload], voice)
-        cached_rows = await _drive(app, [cached_payload] * reps, voice)
+        if voice:
+            # Inject MockSTT so each silent WAV clip is transcribed to the
+            # corresponding real MSMARCO-XI query string. Without this, the
+            # pipeline either fails (no STT key) or rejects an empty transcript
+            # (<1ms), neither of which measures pipeline performance.
+            from src import api as api_module
+            from src.stt import MockSTT
+
+            harness = api_module.get_harness()
+            original_stt = harness.stt_client
+            mock_stt = MockSTT()
+
+            def _set_query_and_get_wav(query_text: str) -> bytes:
+                """Load the mock transcript and return a silent WAV clip."""
+                mock_stt.transcripts["unknown"] = query_text
+                return _silent_wav()
+
+            warm_payloads = [_set_query_and_get_wav(q) for q in queries[:reps]]
+            harness.stt_client = mock_stt
+            try:
+                warm_rows = await _drive(app, warm_payloads, voice=True, delay=delay)
+                # Cache-prime query
+                mock_stt.transcripts["unknown"] = queries[reps]
+                cached_wav = _silent_wav()
+                prime = await _drive(app, [cached_wav], voice=True, delay=delay)
+                if prime and prime[0].get("degraded"):
+                    await asyncio.sleep(60)
+                    prime = await _drive(app, [cached_wav], voice=True)
+                cached_rows = await _drive(app, [cached_wav] * reps, voice=True)
+            finally:
+                harness.stt_client = original_stt
+
+            # Annotate that STT was mocked, not live.
+            for row in warm_rows + cached_rows + prime:
+                row.setdefault("labels", {})["stt_mocked"] = True
+        else:
+            warm_payload = queries[:reps]
+            warm_rows = await _drive(app, warm_payload, voice=False, delay=delay)
+            cached_payload = queries[reps]
+            prime = await _drive(app, [cached_payload], voice=False, delay=delay)
+            if prime and prime[0].get("degraded"):
+                await asyncio.sleep(60)
+                prime = await _drive(app, [cached_payload], voice=False)
+            cached_rows = await _drive(app, [cached_payload] * reps, voice=False)
+
         embedding = await asyncio.to_thread(phase_embedding, delay or 7.0)
     finally:
         await manager.__aexit__(None, None, None)
@@ -336,6 +397,7 @@ async def phase_warm_and_cached(reps: int, voice: bool, delay: float) -> dict:
         "cached": cached_rows,
         "prime": prime,
         "embedding": embedding,
+        "stt_mocked": voice,
     }
 
 
@@ -435,6 +497,7 @@ def write_report(cold: dict, warm_cached: dict, voice: bool, reps: int, delay: f
 
     max_err, mean_err = _honesty_check(warm_rows + cached_rows + cold_rows)
     path = "voice (`POST /query`, audio upload)" if voice else "text (`POST /query/text`)"
+    stt_mocked = warm_cached.get("stt_mocked", False)
 
     lines = [
         "# Full-lifecycle latency trace",
@@ -443,6 +506,19 @@ def write_report(cold: dict, warm_cached: dict, voice: bool, reps: int, delay: f
         "includes middleware, body parsing, response serialization, and body flush. "
         "Percentiles are linear-interpolated.",
         "",
+    ]
+    if stt_mocked:
+        lines += [
+            "> **STT note:** `MockSTT` was injected for the warm/cached phases so that "
+            "every silent WAV clip is mapped to a real MSMARCO-XI query text without a "
+            "network call. This isolates the in-process pipeline (embedding, FAISS, BM25, "
+            "LLM, guardrails) from the network-bound STT round-trip. "
+            "Real Sarvam STT latency (P50 ~395ms, max ~1492ms on a 1-second clip) is "
+            "benchmarked separately by `run_benchmark.py`'s `run_stt_benchmark()`. "
+            "A voice request with real STT adds that round-trip on top of the numbers below.",
+            "",
+        ]
+    lines += [
         "## Trace honesty invariant",
         "",
         "The point of this instrumentation is that `total_ms` is measured independently "

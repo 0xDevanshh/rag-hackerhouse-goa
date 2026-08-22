@@ -200,9 +200,29 @@ Every refusal — from any layer — returns the same canned message, so the use
    `Retriever`'s `low_confidence` flag is set or the top retrieval score is below threshold. Stops the
    model from being asked to improvise over context that doesn't actually cover the question.
 3. **GroundingGuardrail** *(post-generation)* — splits the generated answer into sentences, embeds each,
-   and checks max cosine similarity against the retrieved chunks. If more than 30% of sentences aren't
-   supported by any retrieved passage, the whole answer is discarded — catches hallucination that slips
-   past relevance filtering.
+   and checks max cosine similarity against the retrieved chunks. Catches hallucination that slips past
+   relevance filtering.
+
+   Two details matter for whether correct answers survive it:
+
+   - **Similarity is measured in two passes.** Pass 1 compares each sentence against whole-chunk vectors,
+     read free out of the FAISS index. That is cheap but pessimistic — a one-sentence paraphrase of one
+     sentence inside a 300-character passage is diluted by the rest of the passage. On a correct,
+     fully-grounded answer, pass 1 alone scored 0.600 / 0.702 / 0.505 against a 0.5 threshold: passing,
+     but so narrowly that any wording drift tipped a sentence under. Pass 2 re-scores **only** the failing
+     sentences against the chunks' individual sentences, where the same three score 0.721 / 0.890 / 1.000.
+     Hallucinations ("RAG was invented at Stanford in 1998") score 0.13–0.40 either way and are still
+     refused, so this widens the grounded/ungrounded gap rather than lowering the bar. Citation markers
+     (`[passage_id: X]`) are stripped before embedding — this pipeline's own prompt asks for them, and they
+     dilute short sentences.
+   - **Unsupported sentences are dropped, not fatal.** The old rule discarded the whole answer above 30%
+     unsupported, which was degenerate for short answers: at three sentences it tolerated *zero*
+     (1/3 = 0.33 > 0.3), so one connective sentence threw away two grounded ones and the user was told the
+     dataset had no answer. Now the unsupported sentences are removed and the rest returned — a stricter
+     guarantee on what actually reaches the user, and the same rule `run_streaming` already applied per
+     sentence. Above `max_drift_ratio` (50%) the answer is still refused outright, since returning a small
+     remainder would mislead by omission. *Tradeoff:* dropping a sentence can leave the remainder reading
+     abruptly.
 
 ## Full-request latency tracing (`src/latency.py`, `benchmarks/run_latency_trace.py`)
 
@@ -253,6 +273,45 @@ middleware, multipart parsing, serialization, and flush are all inside the numbe
   22ms after a 7s gap**. Neither is wrong; they bound different traffic shapes. The report measures
   embedding under both conditions rather than picking the flattering one.
 
+### Meeting a sub-200ms end-to-end budget
+
+A **remote LLM cannot meet a 200ms end-to-end budget**, and no amount of local optimization changes that.
+Measured time-to-first-token on the fastest reachable hosted model is 450–680ms — the budget is gone
+before a single token arrives. That is a property of the provider, not of this code.
+
+What does meet it is `LLM_PROVIDER=local` (`ExtractiveProvider`): a zero-network answerer that selects the
+best-supported sentences from the retrieved passages and cites them. Measured through the real ASGI stack,
+20 warm uncached queries drawn from the served corpus:
+
+| path | p50 | p95 | p99 | max | over 200ms |
+|---|---|---|---|---|---|
+| uncached, `LLM_PROVIDER=local` | **28.0 ms** | 41.7 ms | 50.2 ms | 52.3 ms | 0/20 |
+| cached | 0.2 ms | 0.3 ms | — | — | 0/20 |
+| uncached, `LLM_PROVIDER=groq` | 802 ms | 1238 ms | 1368 ms | — | 20/20 |
+
+Over 120 queries taken across `hi_validation_500.jsonl`, the local path answered **119/120 (99%)** with
+`total_ms` p50 14.8 / p95 29.6 / max 36.2, and **0 requests over 200ms**. The single failure is one record
+whose Hindi query field is corrupt — the machine translation of "suit definition" degenerated into the same
+clause repeated ~200 times, and `InputGuardrail` correctly rejects it as repetitive. Its English form
+answers normally.
+
+**The tradeoff is answer style, and it is real.** The local provider *extracts*; it does not *synthesize*.
+
+- Best case it is indistinguishable from the gold answer: "what is a corporation?" returns *"A corporation
+  is a company or group of people authorized to act as a single entity (legally a person) and recognized as
+  such in law. [passage_id: 5]"* — verbatim the dataset's own answer.
+- Worse case it leads with an off-target sentence from the right passage: the Hindi form of the same
+  question opens on a sentence about McDonald's Corporation before giving the correct definition, because
+  sentence choice is query-term overlap rather than comprehension.
+- It reads as quoted passage text, not fluent prose, and inherits the passage's punctuation.
+
+So: `local` for the latency target, `groq` for fluency. Retrieval accuracy bounds both — see the hit-rate
+figures in `src/retrieval.py`; roughly one answerable query in four does not have its labelled passage in
+context even at `top_n=10`.
+
+`bm25_ms` (p50 16.9, p95 29.3) is now the single largest stage on the local path — about 60% of the budget.
+It is the obvious next target if more headroom is wanted; nothing here needed it to hit 200ms.
+
 ### Latency-relevant configuration
 
 | Variable | Default | Why |
@@ -261,6 +320,21 @@ middleware, multipart parsing, serialization, and flush are all inside the numbe
 | `EMBEDDING_TORCH_THREADS` | `1` | Required, not tuning: `faiss-cpu` bundles its own `libomp.dylib` and multi-threaded CPU torch alongside it **SIGSEGVs** on macOS/arm64. Also costs nothing — p50 is within noise across 1–8 threads at batch size 1. |
 | `GROQ_MODEL` | `openai/gpt-oss-20b` | The previous default `llama-3.1-8b-instant` is decommissioned (404). |
 | `TRACE_BUFFER_SIZE` | `0` (off) | Ring buffer of completed traces at `GET /metrics/traces`, including the post-handler spans a response body cannot report about itself. |
+| `LLM_MAX_TOKENS` | `2000` | The default provider is a *reasoning* model whose hidden reasoning is billed against this budget; too low a cap is spent thinking and emits no answer at all. Latency-neutral (the model stops when done). |
+| `LLM_PROVIDER` | auto (`groq` if a key is set, else `local`) | `local` is the only setting that meets a sub-200ms end-to-end budget — see above. `groq`/`anthropic` synthesize more fluent answers at ~800ms+. |
+
+### Which corpus is served (`CORPUS`)
+
+| Value | Serves | Use when |
+|---|---|---|
+| `msmarco` (default) | ai4bharat/MSMARCO-XI only | Measuring retrieval quality — this is what `benchmarks/run_eval.py` scores against. |
+| `demo` | the bundled 2-document corpus | Asking about RAG / this pipeline itself. Too small for meaningful metrics. |
+| `both` | demo documents indexed alongside MSMARCO-XI | Demoing. Costs two extra chunks and answers both kinds of question. |
+
+This matters more than it looks. MSMARCO-XI is real search-engine queries about arbitrary topics — hotels in
+Smithville NJ, how caffeine is metabolised. Asking "what is retrieval augmented generation" against it is
+**correctly** refused by `RelevanceGuardrail`, because the answer genuinely isn't in the corpus. That refusal
+looks identical to a bug. Use `CORPUS=both` (or `demo`) to ask questions about the system itself.
 
 ## Latency methodology (`benchmarks/`)
 

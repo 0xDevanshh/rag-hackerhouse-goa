@@ -21,6 +21,10 @@ from src.chunking import Chunk
 
 logger = logging.getLogger(__name__)
 
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+if HF_TOKEN:
+    os.environ["HF_TOKEN"] = HF_TOKEN
+
 
 def _int_env(name: str, default: int) -> int:
     """

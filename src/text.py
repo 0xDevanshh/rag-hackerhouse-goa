@@ -7,6 +7,19 @@ chunking, grounding checks, and streaming all agree on where a sentence ends.
 
 import re
 
+# The exact sentence the generation prompt instructs the model to return when
+# the retrieved context doesn't cover the question.
+#
+# Lives here, with the other shared text definitions, for the same reason the
+# sentence-boundary regex does: two modules have to agree on it. generation.py
+# interpolates it into SYSTEM_PROMPT and returns it from the local provider;
+# guardrails.py has to *recognise* it, so that a model correctly declining
+# isn't run through the hallucination check and reported as a caught
+# fabrication. Defining it in generation.py and importing from there would
+# also drag the anthropic and groq SDKs into the guardrail import path for the
+# sake of one string.
+NO_CONTEXT_RESPONSE = "I don't have enough information in the provided context to answer that."
+
 # Sentence-final punctuation, Latin plus the Indic and Urdu marks the corpus
 # actually contains. Devanagari and most Indic scripts end sentences with the
 # danda "।" (U+0964), not a period, and Urdu uses the Arabic full stop "۔"

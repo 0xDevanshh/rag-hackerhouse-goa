@@ -79,6 +79,11 @@ SARVAM_REALTIME_URL = "wss://api.sarvam.ai/speech-to-text-realtime/ws"
 # indexed in both the target language and the original English (so a query in
 # either language can retrieve), falling back to the bundled demo corpus if
 # the dataset can't be loaded.
+CORPUS = os.environ.get("CORPUS", "msmarco").strip().lower()
+if CORPUS not in ("msmarco", "demo", "both"):
+    logger.warning("unknown CORPUS=%r; falling back to 'msmarco'", CORPUS)
+    CORPUS = "msmarco"
+
 CORPUS_LANGUAGE = os.environ.get("CORPUS_LANGUAGE", "hi")
 CORPUS_SPLIT = os.environ.get("CORPUS_SPLIT", "validation")
 CORPUS_LIMIT = int(os.environ.get("CORPUS_LIMIT", "500"))
@@ -125,16 +130,32 @@ def _load_msmarco_chunks() -> list:
 
 def _load_default_chunks() -> list:
     """
-    Build the chunk set the API serves: MSMARCO-XI if it's available,
-    otherwise the bundled demo corpus.
+    Build the chunk set the API serves, selected by the CORPUS env var:
 
-    The fallback keeps the backend startable with no network and no dataset
-    cache (a fresh clone, an offline demo, CI), where load_chunker_docs would
-    otherwise have to stream ~500 examples from the Hub before /query could
-    answer anything. Which corpus won is logged, since the two produce very
-    different answers and silently serving the 2-document demo corpus while
+      "msmarco" (default) — ai4bharat/MSMARCO-XI only. Real search-engine
+          queries about arbitrary topics. This is the corpus the retrieval
+          evaluation scores against, so it is the right default for measuring
+          quality — but it means an off-corpus question ("what is retrieval
+          augmented generation") is *correctly* refused by RelevanceGuardrail,
+          because the answer genuinely isn't in there.
+      "demo" — the bundled 2-document corpus only. Covers RAG and voice-
+          pipeline concepts, so questions about how this system works get real
+          answers. Too small for meaningful retrieval metrics.
+      "both" — demo documents indexed alongside MSMARCO-XI. Costs a couple of
+          extra chunks and lets the demo answer questions about itself without
+          giving up the MSMARCO corpus.
+
+    MSMARCO loading falls back to the demo corpus on failure, which keeps the
+    backend startable with no network and no dataset cache (a fresh clone, an
+    offline demo, CI). Which corpus actually won is logged either way: the two
+    produce very different answers, and silently serving 2 documents while
     believing MSMARCO-XI is loaded would be badly misleading.
     """
+    if CORPUS == "demo":
+        chunks = _load_sample_chunks()
+        logger.info("serving the bundled demo corpus only (%d chunks, CORPUS=demo)", len(chunks))
+        return chunks
+
     try:
         chunks = _load_msmarco_chunks()
     except Exception as exc:
@@ -145,6 +166,11 @@ def _load_default_chunks() -> list:
             DEFAULT_CORPUS_PATH,
         )
         return _load_sample_chunks()
+
+    if CORPUS == "both":
+        demo_chunks = _load_sample_chunks()
+        chunks = chunks + demo_chunks
+        logger.info("added %d demo chunks alongside MSMARCO-XI (CORPUS=both)", len(demo_chunks))
 
     languages = sorted({chunk.metadata.get("language") for chunk in chunks})
     logger.info(
@@ -185,32 +211,38 @@ def get_harness() -> PipelineHarness:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Eagerly build the harness, index its corpus, and pay every cold-start
-    cost at process startup rather than inside whichever request happens to
-    arrive first.
+    Keep startup resilient in constrained deployments while still attempting the
+    one-time warmup work that improves first-request latency.
 
-    The index build was already done here. What's added is
-    PipelineHarness.prewarm(), which covers the three costs that a live
-    request was still absorbing:
-
-      - the embedding model's lazy initialization: ~690ms on the very first
-        encode of a process, plus a fresh per-shape cost on MPS
-      - the LLM provider's DNS + TCP + TLS handshake: ~80ms to api.groq.com
-      - the STT provider's handshake: ~100ms to api.sarvam.ai
-
-    A one-time cost belongs at startup, not inside a live request's budget.
+    In production we must never let a cold-start bootstrap failure take the
+    whole service down: a missing token, slow Hugging Face fetch, or a slow
+    corpus build should log a warning and keep /health alive. The first real
+    request can still build the missing pieces lazily.
     """
     try:
         harness = get_harness()
     except HTTPException:
         # No LLM key configured yet: get_harness() already recorded
         # _harness_init_error, so /query will return a clear 503 on first
-        # use. Nothing to warm up until that's fixed (and the process
-        # restarted) — startup itself must still succeed either way.
+        # use. Nothing to warm up until that's fixed and the process is
+        # restarted — startup itself must still succeed either way.
         yield
         return
-    harness.store.build(harness.chunks)
-    await harness.prewarm()
+
+    startup_timeout = float(os.environ.get("STARTUP_TIMEOUT_SECONDS", "60"))
+    try:
+        # Via the harness, not store.build() directly, so the index version the
+        # answer cache keys on actually reflects this build. Keep it bounded:
+        # a heavy first-run index build must never keep the app from coming up.
+        await asyncio.wait_for(asyncio.to_thread(harness.build_index), timeout=startup_timeout)
+    except Exception as exc:
+        logger.warning("startup index build skipped (%s: %s); app will continue with lazy initialization", type(exc).__name__, exc)
+
+    try:
+        await asyncio.wait_for(harness.prewarm(), timeout=min(startup_timeout, 30.0))
+    except Exception as exc:
+        logger.warning("startup prewarm skipped (%s: %s); app will continue with lazy warmup", type(exc).__name__, exc)
+
     yield
 
 
@@ -518,17 +550,47 @@ class TextQuery(BaseModel):
 @app.post("/query/text", response_model=PipelineResult)
 async def query_text(body: TextQuery, request: Request) -> PipelineResult:
     """
-    Run one already-typed question through the pipeline, skipping STT.
+    Fast path: run one already-typed question through the pipeline using the
+    local extractive provider (zero network calls beyond embedding + FAISS).
 
-    This is the fast path, and the only route that can plausibly come in under
-    200ms: /query must first ship the audio to Sarvam and wait for a
-    transcript, which alone measured 250-525ms on a one-second clip. A cached
-    text query returns in single-digit milliseconds of pipeline work; an
-    uncached one still has to wait on the LLM.
+    This is the default text endpoint and what the frontend uses after STT.
+    Expected total latency: ~30-50ms (embedding + BM25 + FAISS + grounding
+    short-circuit).  Grounding is verified structurally (every answer sentence
+    is a verbatim word-subset of a retrieved passage) rather than by a second
+    embedding pass, so grounding_guard_ms ≈ 0ms on this path.
+
+    For LLM-quality answers use POST /query/text/llm (explicit opt-in).
+    """
+    from src.generation import ExtractiveProvider, Generator
+
+    trace = _request_trace(request)
+    harness = get_harness()
+    result = await harness.run(
+        body.query,
+        trace=trace,
+        generator=Generator(provider=ExtractiveProvider()),
+    )
+    trace.mark("route_end")
+    return result
+
+
+@app.post("/query/text/llm", response_model=PipelineResult)
+async def query_text_llm(body: TextQuery, request: Request) -> PipelineResult:
+    """
+    Quality path: run one already-typed question through the pipeline using
+    the configured LLM provider (Groq / Anthropic, selected by LLM_PROVIDER).
+
+    This path runs two network round-trips: one to the LLM (~700-1300ms) and
+    one embedding pass for grounding verification.  It cannot meet the <200ms
+    latency target.  Use it when answer quality matters more than latency, e.g.
+    complex multi-sentence questions or questions that need synthesis across
+    multiple passages.
+
+    For the fast default path use POST /query/text.
     """
     trace = _request_trace(request)
     harness = get_harness()
-    result = await harness.run(body.query, trace=trace)
+    result = await harness.run(body.query, trace=trace)  # uses harness.generator = Groq/Anthropic
     trace.mark("route_end")
     return result
 
@@ -560,6 +622,79 @@ async def query(audio: UploadFile = File(...), request: Request = None) -> Pipel
         filename=audio.filename or "audio.wav",
         content_type=audio.content_type,
         trace=trace,
+    )
+    trace.mark("route_end")
+    return result
+
+
+@app.post("/query/realtime", response_model=PipelineResult)
+async def query_realtime(audio: UploadFile = File(...), request: Request = None) -> PipelineResult:
+    """
+    Lowest-latency audio path: overlaps retrieval with STT by firing retrieval
+    on the first *stable* partial transcript while Sarvam is still streaming
+    the audio.  When the final transcript arrives and retrieval is already
+    complete, the pipeline skips straight to guardrail + fast grounded answer,
+    saving the retrieval round-trip (~80ms P50) from the critical path.
+
+    Uses the fast grounded (local extractive) answer path by default so the
+    remote LLM (~700-1300ms) doesn't undo the overlap savings.  Set
+    LLM_PROVIDER=groq/anthropic in the environment to switch to a hosted model.
+
+    The trace in the response body includes:
+      - stt_to_first_partial_ms : time from stream open to first partial
+      - stt_final_ms            : full STT wall clock (stream open → final)
+      - retrieval_on_partial_ms : wall clock from stable partial to retrieval done
+      - stt_overlap_savings_ms  : retrieval ms that ran concurrently with STT
+      - total_ms                : ASGI entry → response flush (never adjusted)
+
+    Requires SARVAM_API_KEY; falls back to a 503 if missing.
+    """
+    trace = _request_trace(request)
+    harness = get_harness()
+    with trace.span("body_parse"):
+        audio_bytes = await audio.read()
+        trace.label("audio_bytes", len(audio_bytes))
+    result = await harness.run_overlapped(
+        audio_bytes,
+        filename=audio.filename or "audio.wav",
+        content_type=audio.content_type,
+        trace=trace,
+    )
+    trace.mark("route_end")
+    return result
+
+
+class RealtimeTextQuery(BaseModel):
+    """A pre-transcribed question for benchmarking the overlapped path."""
+
+    query: str
+
+
+@app.post("/query/realtime/text", response_model=PipelineResult)
+async def query_realtime_text(body: RealtimeTextQuery, request: Request) -> PipelineResult:
+    """
+    Benchmark-only endpoint: runs the overlapped pipeline path with a
+    MockRealtimeSTT that emits canned partial + final events for `query`,
+    so the overlap instrumentation is exercised without a live microphone
+    or SARVAM_API_KEY.
+
+    The trace includes the same overlap spans as /query/realtime, making
+    it possible to measure the post-STT pipeline latency (embedding,
+    FAISS, BM25, guardrails, fast answer) in an automated benchmark.
+    """
+    from src.stt import MockRealtimeSTT
+
+    trace = _request_trace(request)
+    harness = get_harness()
+
+    mock = MockRealtimeSTT()
+    mock._transcripts["unknown"] = body.query
+
+    result = await harness.run_overlapped(
+        b"mock-audio",          # ignored by MockRealtimeSTT
+        filename="mock.wav",
+        trace=trace,
+        realtime_stt_client=mock,
     )
     trace.mark("route_end")
     return result

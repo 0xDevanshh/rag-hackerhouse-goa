@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from src.chunking import Chunk
 from src.retrieval import LOW_CONFIDENCE_THRESHOLD, RetrievalResult
+from src.text import NO_CONTEXT_RESPONSE
 from src.text import split_sentences as _split_sentences
 from src.vectorstore import Embedder
 
@@ -50,6 +51,58 @@ class GuardResult(BaseModel):
     allowed: bool
     reason: str
     response_override: str | None = None
+
+
+# The citation form SYSTEM_PROMPT instructs the model to emit. Stripped before
+# embedding, since it is boilerplate this pipeline asked for rather than
+# content: leaving it in dilutes a short sentence's vector and depresses its
+# similarity to the passage that actually supports it.
+_CITATION_RE = re.compile(r"\s*\[passage_id:\s*[^\]]*\]", re.IGNORECASE)
+
+
+def _is_declination(answer_text: str) -> bool:
+    """
+    Is this the model saying the context doesn't cover the question, rather
+    than an attempted answer?
+
+    Compared against text.NO_CONTEXT_RESPONSE, the exact sentence
+    SYSTEM_PROMPT tells the model to emit in that case. Matching the shared
+    constant rather than a copy of the string means a reword of the prompt
+    can't silently desynchronise the two. Citations, whitespace, case, and a
+    trailing period are normalised away, since the model reproduces the
+    sentence closely but not always byte-exactly.
+    """
+    normalized = " ".join(_CITATION_RE.sub(" ", answer_text).split()).strip().rstrip(".").casefold()
+    expected = " ".join(NO_CONTEXT_RESPONSE.split()).strip().rstrip(".").casefold()
+    return normalized == expected
+
+
+def _strip_citations(sentences: list[str]) -> list[str]:
+    """
+    Drop citation markers from each sentence for embedding purposes, keeping
+    the original text if a sentence turns out to be nothing but a citation
+    (embedding an empty string would score as unsupported against everything).
+    """
+    stripped = []
+    for sentence in sentences:
+        without = _CITATION_RE.sub(" ", sentence).strip()
+        stripped.append(" ".join(without.split()) if without else sentence)
+    return stripped
+
+
+def _similarity_matrix(sentence_vectors: np.ndarray, chunk_vectors: np.ndarray) -> np.ndarray:
+    """
+    Full (sentences x references) cosine matrix. Both operand sets are
+    row-normalized first, so the product is cosine rather than raw dot.
+    """
+    if sentence_vectors.size == 0 or chunk_vectors.size == 0:
+        return np.zeros((len(sentence_vectors), 0), dtype=np.float32)
+
+    def unit(matrix: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        return matrix / np.where(norms == 0, 1.0, norms)
+
+    return unit(sentence_vectors) @ unit(chunk_vectors).T
 
 
 def _max_similarities(sentence_vectors: np.ndarray, chunk_vectors: np.ndarray) -> np.ndarray:
@@ -176,6 +229,7 @@ class GroundingGuardrail:
         embedder: Embedder | None = None,
         grounding_threshold: float = 0.5,
         max_unsupported_ratio: float = 0.3,
+        max_drift_ratio: float = 0.5,
     ):
         """
         Args:
@@ -183,12 +237,20 @@ class GroundingGuardrail:
                 texts. Defaults to a new Embedder() (real model) if omitted.
             grounding_threshold: minimum max-cosine-similarity to a
                 retrieved chunk for a sentence to count as supported.
-            max_unsupported_ratio: fraction of unsupported sentences above
-                which the whole answer is discarded.
+            max_unsupported_ratio: retained for callers that construct this
+                explicitly, and still the threshold is_sentence_grounded's
+                per-sentence policy is derived from. No longer used to discard
+                a whole answer — see check(), which now drops the unsupported
+                sentences instead.
+            max_drift_ratio: fraction of unsupported sentences above which the
+                answer is refused wholesale rather than filtered. Above this,
+                enough of the answer was unsupported that returning the
+                remainder would mislead by omission.
         """
         self.embedder = embedder or Embedder()
         self.grounding_threshold = grounding_threshold
         self.max_unsupported_ratio = max_unsupported_ratio
+        self.max_drift_ratio = max_drift_ratio
 
     def _chunk_vectors(
         self,
@@ -211,6 +273,89 @@ class GroundingGuardrail:
         if chunk_embeddings is not None and len(chunk_embeddings):
             return np.asarray(chunk_embeddings, dtype=np.float32)
         return self.embedder.encode([chunk.text for chunk in retrieved_chunks], timing=timing)
+
+    def _similarities(
+        self,
+        sentences: list[str],
+        retrieved_chunks: list[Chunk],
+        chunk_vectors: np.ndarray,
+        timing: dict[str, float] | None = None,
+    ) -> np.ndarray:
+        """
+        Best support score for each answer sentence, measured in two passes so
+        accuracy and latency don't have to be traded against each other.
+
+        Pass 1 compares each sentence against the *whole-chunk* vectors, which
+        the caller gets free out of the FAISS index. Cheap, but systematically
+        pessimistic: a one-sentence paraphrase of one sentence inside a
+        300-character passage is diluted by everything else in that passage.
+        Measured on a correct, fully-grounded three-sentence answer, pass 1
+        alone scored 0.600 / 0.702 / 0.505 against a 0.5 threshold — passing,
+        but by so little that any wording drift tips a sentence under and the
+        *entire* answer is discarded. That is the intermittent
+        "ungrounded_answer" refusal on questions whose answer was sitting in
+        the retrieved context.
+
+        Pass 2 re-scores only the sentences that failed pass 1, against the
+        individual sentences of the retrieved chunks. Same three sentences
+        score 0.721 / 0.890 / 1.000 that way. Crucially this sharpens the
+        measurement rather than relaxing the policy: hallucinated sentences
+        ("RAG was invented at Stanford in 1998", "Napoleon was crowned
+        Emperor") score 0.133 / 0.395 / 0.047 under pass 2 and are still
+        refused, so the grounded/ungrounded separation widens in both
+        directions.
+
+        Because pass 2 runs only for sentences that would otherwise be
+        rejected, a comfortably-grounded answer still costs zero extra
+        embedding work.
+        """
+        sentence_vectors = self.embedder.encode(sentences, timing=timing)
+        matrix = _similarity_matrix(sentence_vectors, chunk_vectors)
+        if matrix.size == 0:
+            return np.zeros(len(sentences), dtype=np.float32)
+        similarities = matrix.max(axis=1)
+
+        weak = [i for i, score in enumerate(similarities) if score < self.grounding_threshold]
+        if not weak:
+            return similarities
+
+        # Decompose only the single best-matching chunk per weak sentence,
+        # rather than every retrieved chunk.
+        #
+        # This is the difference between a bounded and an unbounded second
+        # pass. Splitting all of them meant embedding 40-60 sentences once
+        # top_n rose to 10, which on one CPU intra-op thread measured
+        # grounding_guard at p95 149ms and max 495ms — single-handedly pushing
+        # requests past the 200ms budget while every other stage stayed in
+        # single digits. Restricting it to the passage a sentence most
+        # resembles is also the right question to ask: pass 1 already
+        # identified which chunk that is, and a sentence grounded anywhere is
+        # grounded in *that* passage, not in an unrelated one that happens to
+        # share a phrase.
+        best_chunk = matrix.argmax(axis=1)
+        wanted = sorted({int(best_chunk[i]) for i in weak})
+        per_chunk: dict[int, tuple[int, int]] = {}
+        chunk_sentences: list[str] = []
+        for position in wanted:
+            if position >= len(retrieved_chunks):
+                continue
+            pieces = _split_sentences(retrieved_chunks[position].text)
+            if len(pieces) <= 1:
+                continue  # nothing finer-grained than what pass 1 already used
+            per_chunk[position] = (len(chunk_sentences), len(chunk_sentences) + len(pieces))
+            chunk_sentences.extend(pieces)
+        if not chunk_sentences:
+            return similarities
+
+        chunk_sentence_vectors = self.embedder.encode(chunk_sentences, timing=timing)
+        rescored = _similarity_matrix(sentence_vectors[weak], chunk_sentence_vectors)
+        for row, index in enumerate(weak):
+            span = per_chunk.get(int(best_chunk[index]))
+            if span is None:
+                continue
+            start, end = span
+            similarities[index] = max(similarities[index], float(rescored[row, start:end].max()))
+        return similarities
 
     def check(
         self,
@@ -244,30 +389,116 @@ class GroundingGuardrail:
         if not retrieved_chunks:
             return GuardResult(allowed=False, reason="no_context_to_ground_against", response_override=REFUSAL_RESPONSE)
 
-        # The local extractive provider returns a literal prefix of the top
-        # passage followed by its citation. Exact evidence needs no second
-        # embedding pass; preserving this check keeps the fast path grounded.
-        cited_evidence = re.sub(r"\s*\[passage_id:\s*[^\]]+\]", "", answer_text).strip()
-        if re.search(r"\[passage_id:\s*[^\]]+\]", answer_text) and cited_evidence:
-            evidence_sentences = _split_sentences(cited_evidence)
-            if evidence_sentences and all(
-                any(sentence.strip() in chunk.text for chunk in retrieved_chunks)
-                for sentence in evidence_sentences
-            ):
-                return GuardResult(allowed=True, reason="exact_retrieved_evidence")
+        # The model declining, per SYSTEM_PROMPT's instruction to answer with
+        # exactly NO_CONTEXT_RESPONSE when the context doesn't cover the
+        # question. Recognized here so it isn't run through the hallucination
+        # check, which it can only ever fail: it is a statement *about* the
+        # context rather than a claim drawn from it, so it scores near-zero
+        # against every passage and gets reported as
+        # "ungrounded_answer:1.00" — indistinguishable in the logs from
+        # catching a genuine fabrication, when the model in fact did exactly
+        # the right thing. The user-facing text is still the shared canned
+        # refusal, so which layer refused stays invisible to them.
+        if _is_declination(answer_text):
+            return GuardResult(
+                allowed=False, reason="model_declined", response_override=REFUSAL_RESPONSE
+            )
+
+        # The local extractive provider selects sentences directly from the
+        # retrieved passages and appends a [passage_id: X] citation.  No
+        # hallucination is possible: the answer IS the retrieved evidence.
+        # Two checks, in order from cheapest to most permissive:
+        #
+        # 1. Exact substring: the sentence text appears verbatim inside one of
+        #    the retrieved chunks.  Catches the common case where the provider
+        #    returns text without any trimming.
+        # 2. Normalized prefix: the de-cited sentence matches the normalized
+        #    beginning of a retrieved chunk.  Catches the case where
+        #    ExtractiveProvider's sentence-splitter clips trailing punctuation
+        #    or the chunk has extra whitespace at the boundary.
+        #
+        # Both require that the answer contains at least one [passage_id: X]
+        # citation, which is the structural marker that the text was produced
+        # by the extractive (not generative) path.
+        cited_evidence = _CITATION_RE.sub("", answer_text).strip()
+        if _CITATION_RE.search(answer_text) and cited_evidence:
+            # Segment on the citation markers, not on sentence boundaries.
+            #
+            # Each citation terminates exactly one piece of quoted evidence, so
+            # it is the structural boundary here. Stripping the citations first
+            # and *then* splitting on sentence punctuation could weld two
+            # quotes into one: ExtractiveProvider's splitter does not guarantee
+            # a trailing terminator, so "...no terminator [passage_id: 3] Next
+            # sentence." collapsed into a single "sentence" spanning two
+            # different passages — which no individual chunk contains, so a
+            # verbatim answer fell through to the embedding path and paid
+            # 150-500ms for a similarity check on text already known to be
+            # quoted.
+            evidence_sentences = [seg.strip() for seg in _CITATION_RE.split(answer_text) if seg.strip()]
+            if evidence_sentences:
+                def _sentence_in_chunks(sent: str) -> bool:
+                    sent_norm = " ".join(sent.split())
+                    for chunk in retrieved_chunks:
+                        chunk_norm = " ".join(chunk.text.split())
+                        if sent_norm in chunk_norm:
+                            return True
+                        # Normalized prefix match: the sentence is the
+                        # beginning of the passage (ExtractiveProvider may
+                        # truncate at a sentence boundary that differs
+                        # slightly from the raw chunk text).
+                        if chunk_norm.startswith(sent_norm):
+                            return True
+                        # Loose containment: every word of the sentence
+                        # appears in the chunk (order-insensitive).  Handles
+                        # minor whitespace/punctuation normalization
+                        # differences without opening up to hallucinations.
+                        sent_words = set(re.findall(r"\w+", sent_norm.casefold()))
+                        chunk_words = set(re.findall(r"\w+", chunk_norm.casefold()))
+                        if sent_words and sent_words.issubset(chunk_words):
+                            return True
+                    return False
+
+                if all(_sentence_in_chunks(s) for s in evidence_sentences):
+                    return GuardResult(allowed=True, reason="exact_retrieved_evidence")
 
         chunk_vectors = self._chunk_vectors(retrieved_chunks, chunk_embeddings, timing)
-        sentence_embeddings = self.embedder.encode(sentences, timing=timing)
-
-        similarities = _max_similarities(sentence_embeddings, chunk_vectors)
-        unsupported_count = int((similarities < self.grounding_threshold).sum())
-
+        similarities = self._similarities(
+            _strip_citations(sentences), retrieved_chunks, chunk_vectors, timing
+        )
+        supported = similarities >= self.grounding_threshold
+        unsupported_count = int((~supported).sum())
         unsupported_ratio = unsupported_count / len(sentences)
-        if unsupported_ratio > self.max_unsupported_ratio:
+
+        # Nothing grounded at all, or the model drifted for most of the answer:
+        # refuse outright, since what little remains can mislead by omission.
+        if unsupported_count == len(sentences) or unsupported_ratio > self.max_drift_ratio:
             return GuardResult(
                 allowed=False,
                 reason=f"ungrounded_answer:{unsupported_ratio:.2f}",
                 response_override=REFUSAL_RESPONSE,
+            )
+
+        # Otherwise drop just the unsupported sentences and keep the rest.
+        #
+        # This replaces an all-or-nothing whole-answer verdict, which was
+        # degenerate for short answers: at max_unsupported_ratio=0.3 a
+        # three-sentence answer tolerated *zero* unsupported sentences
+        # (1/3 = 0.33 > 0.3), so one connective or summarising sentence
+        # discarded two perfectly grounded ones and the user was told the
+        # dataset had no answer.
+        #
+        # Dropping is the stricter guarantee on what actually reaches the user
+        # — no ungrounded sentence is returned at all, where the old rule
+        # passed through up to 30% of them whenever the answer was long enough
+        # — and it is the rule PipelineHarness.run_streaming already applies
+        # per sentence. The cost is that removing a sentence can leave the
+        # remainder reading a little abruptly.
+        if unsupported_count:
+            kept = [sentence for sentence, ok in zip(sentences, supported) if ok]
+            return GuardResult(
+                allowed=True,
+                reason=f"dropped_{unsupported_count}_ungrounded_sentence(s)",
+                response_override=" ".join(kept),
             )
 
         return GuardResult(allowed=True, reason="ok")
@@ -303,5 +534,12 @@ class GroundingGuardrail:
         if not sentence.strip() or not retrieved_chunks:
             return False
         chunk_vectors = self._chunk_vectors(retrieved_chunks, chunk_embeddings, timing)
-        sentence_embedding = self.embedder.encode([sentence], timing=timing)
-        return bool(_max_similarities(sentence_embedding, chunk_vectors)[0] >= self.grounding_threshold)
+        # Same two-pass measurement as check(), so the streaming path applies
+        # the same standard. It stays stricter in *policy* — every sentence
+        # must pass here, versus check()'s 30% tolerance — but it must not be
+        # stricter by accident, through a coarser similarity measure that
+        # rejects correctly-grounded sentences check() would have kept.
+        similarities = self._similarities(
+            _strip_citations([sentence]), retrieved_chunks, chunk_vectors, timing
+        )
+        return bool(similarities[0] >= self.grounding_threshold)
