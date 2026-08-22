@@ -400,6 +400,32 @@ an answer-cache hit costs the full STT time — the measured cached *voice* path
 venv/bin/python -m pytest tests/ -q
 ```
 
+## Backend Docker deployment
+
+Only the FastAPI backend is containerized. The Next.js frontend remains a separate Render service.
+Docker loads the prebuilt RAG index once at startup; S3/MinIO is never used in the query hot path.
+
+Build the artifact set on an indexing machine, then upload all five files under one S3-compatible
+prefix (`manifest.json`, `faiss.index`, `bm25.pkl`, `chunks.json`, and `metadata.json`):
+
+```bash
+python scripts/build_rag_artifacts.py --output-dir artifacts/hi-v1 --version v1 --limit 500
+```
+
+Configure the backend with `RAG_ARTIFACT_BUCKET`, `RAG_ARTIFACT_PREFIX`, and optional
+`RAG_ARTIFACT_VERSION`, plus `S3_ENDPOINT_URL`, `S3_REGION`, `S3_ACCESS_KEY`, and `S3_SECRET_KEY`.
+For AWS, leave `S3_ENDPOINT_URL` empty and use the provider's normal credentials. For MinIO, set the
+endpoint to its reachable URL. The service reports `/health` when the process is alive and `/ready`
+only after the artifact index and generation provider are usable.
+
+```bash
+docker build -t rag-backend:local .
+docker run --rm -p 8000:8000 --env-file .env rag-backend:local
+```
+
+Render uses the root `Dockerfile`, binds to its supplied `PORT`, and health-checks `/health`. Docker
+must be installed and its daemon running before the local build commands can be executed.
+
 ## Project layout
 
 ```

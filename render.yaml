@@ -2,10 +2,11 @@ services:
   # ── Python FastAPI backend ─────────────────────────────────────────────
   - type: web
     name: voice-rag-api
-    runtime: python
+    runtime: docker
     rootDir: .
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn src.api:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
     envVars:
       - key: SARVAM_API_KEY
         sync: false
@@ -31,18 +32,19 @@ services:
         value: "5"
       - key: ALLOWED_ORIGIN
         sync: false   # set to your frontend URL in the Render dashboard
+      - key: RAG_ARTIFACT_BUCKET
+        sync: false
+      - key: RAG_ARTIFACT_PREFIX
+        sync: false
+      - key: RAG_ARTIFACT_VERSION
+        sync: false
+      - key: S3_ENDPOINT_URL
+        sync: false
+      - key: S3_REGION
+        value: us-east-1
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
     autoDeploy: true
 
-  # ── Next.js frontend ───────────────────────────────────────────────────
-  - type: web
-    name: voice-rag-frontend
-    runtime: node
-    rootDir: frontend
-    buildCommand: pnpm install --frozen-lockfile && pnpm build
-    startCommand: pnpm start
-    envVars:
-      - key: NEXT_PUBLIC_API_URL
-        sync: false   # set to your backend service URL in the Render dashboard
-      - key: NODE_VERSION
-        value: "20"
-    autoDeploy: true

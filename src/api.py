@@ -34,6 +34,7 @@ from pydantic import BaseModel
 import websockets
 
 from src import data_loader
+from src.artifact_store import artifact_storage_configured, load_artifacts
 from src.chunking import ChunkerRegistry
 from src.harness import PipelineHarness, PipelineResult
 from src.latency import RequestTrace
@@ -201,7 +202,8 @@ def get_harness() -> PipelineHarness:
         raise HTTPException(status_code=503, detail=f"Pipeline not configured: {_harness_init_error}")
     try:
         store = VectorStore()
-        _harness = PipelineHarness(store=store, chunks=_load_default_chunks())
+        chunks = [] if artifact_storage_configured() else _load_default_chunks()
+        _harness = PipelineHarness(store=store, chunks=chunks)
         return _harness
     except Exception as exc:
         _harness_init_error = str(exc)
@@ -230,13 +232,26 @@ async def lifespan(app: FastAPI):
         return
 
     startup_timeout = float(os.environ.get("STARTUP_TIMEOUT_SECONDS", "60"))
-    try:
-        # Via the harness, not store.build() directly, so the index version the
-        # answer cache keys on actually reflects this build. Keep it bounded:
-        # a heavy first-run index build must never keep the app from coming up.
-        await asyncio.wait_for(asyncio.to_thread(harness.build_index), timeout=startup_timeout)
-    except Exception as exc:
-        logger.warning("startup index build skipped (%s: %s); app will continue with lazy initialization", type(exc).__name__, exc)
+    if artifact_storage_configured():
+        logger.info("loading RAG artifacts from S3-compatible storage")
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(load_artifacts, harness.store, harness.retriever),
+                timeout=startup_timeout,
+            )
+            harness._index_version += 1
+        except Exception as exc:
+            logger.error("RAG artifact startup failed: %s: %s", type(exc).__name__, exc)
+            yield
+            return
+    else:
+        try:
+            # Via the harness, not store.build() directly, so the index version the
+            # answer cache keys on actually reflects this build. Keep it bounded:
+            # a heavy first-run index build must never keep the app from coming up.
+            await asyncio.wait_for(asyncio.to_thread(harness.build_index), timeout=startup_timeout)
+        except Exception as exc:
+            logger.warning("startup index build skipped (%s: %s); app will continue with lazy initialization", type(exc).__name__, exc)
 
     try:
         await asyncio.wait_for(harness.prewarm(), timeout=min(startup_timeout, 30.0))
@@ -377,7 +392,7 @@ def realtime_stt_config() -> JSONResponse:
     """
     token = os.environ.get("SARVAM_REALTIME_TOKEN")
     if not token or token.startswith("your_"):
-        return JSONResponse(status_code=404, content={"direct": False})
+        return JSONResponse(status_code=200, content={"direct": False})
     return {
         "direct": True,
         "url": SARVAM_REALTIME_URL,
@@ -735,4 +750,4 @@ async def query_stream(audio: UploadFile = File(...), request: Request = None) -
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))

@@ -1,0 +1,6 @@
+{
+  "version": "v1",
+  "chunks": 9990,
+  "embedding_model": "paraphrase-multilingual-MiniLM-L12-v2",
+  "created_at": "2026-08-22T14:44:34.724196+00:00"
+}
