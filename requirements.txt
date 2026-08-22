@@ -17,4 +17,5 @@ requests
 websockets
 python-dotenv
 tenacity
+boto3
 pytest

@@ -32,8 +32,7 @@ class Settings(BaseModel):
     corpus_limit: int = Field(default=500, ge=1)
     corpus_include_english: bool = True
     rag_target_ms: float = Field(default=200.0, gt=0)
-    allowed_origin: str = "http://localhost:3000"
-
+    allowed_origin: str = "https://rag-hackerhouse-goa-sh3s.onrender.com"
 
 def load_settings() -> Settings:
     """

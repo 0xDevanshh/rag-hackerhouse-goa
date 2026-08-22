@@ -21,6 +21,7 @@ dependencies = [
     "websockets",
     "python-dotenv",
     "tenacity",
+    "boto3",
 ]
 
 # src/ is imported from the working directory, not installed as a package, so

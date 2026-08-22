@@ -60,15 +60,30 @@ _STOPWORDS = {
 }
 
 _PUNCTUATION_RE = re.compile(r"[^\w\s]", re.UNICODE)
+_DOTTED_ACRONYM_RE = re.compile(r"\b(?:[A-Za-z]\s*[.]\s*){2,}[A-Za-z]\.?\b")
+
+
+def _canonicalize_dotted_acronyms(text: str) -> str:
+    """Make dotted Latin acronyms one lexical token without changing prose punctuation."""
+    return _DOTTED_ACRONYM_RE.sub(
+        lambda match: re.sub(r"[^A-Za-z]", "", match.group(0)), text
+    )
 
 
 def normalize_query(text: str) -> str:
     """Canonicalize query text consistently for routing, lexical search, and caches."""
-    return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = _canonicalize_dotted_acronyms(normalized)
+    return " ".join(normalized.split())
 
 
 def _tokens(text: str) -> list[str]:
     return re.findall(r"\w+", normalize_query(text), flags=re.UNICODE)
+
+
+def _acronyms(text: str) -> set[str]:
+    """Return short Latin acronym tokens suitable for exact-match boosting."""
+    return {token for token in _tokens(text) if 2 <= len(token) <= 8 and token.isascii() and token.isalpha()}
 
 
 class QueryRouter:
@@ -280,9 +295,14 @@ class Retriever:
         fusion_ended = time.perf_counter()
 
         reranked = []
+        query_acronyms = _acronyms(query)
         for chunk, cosine_score, position in candidates:
             lexical_score = lexical_scores.get(position, 0.0) / lexical_max if lexical_max else 0.0
             score = cosine_score + self.lexical_weight * lexical_score
+            if query_acronyms:
+                chunk_acronyms = _acronyms(chunk.text)
+                if query_acronyms & chunk_acronyms:
+                    score += 0.15
             if chunk.metadata.get("is_selected"):
                 score += self.is_selected_boost
             if chunk.metadata.get("language") == query_language:
